@@ -1,0 +1,13 @@
+import { chromium } from 'playwright';
+import { spawn } from 'node:child_process';
+const s = spawn(process.execPath, ['tools/serve.mjs','8299'], {stdio:'ignore'});
+await new Promise(r=>setTimeout(r,500));
+const b = await chromium.launch({args:['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader','--ignore-gpu-blocklist','--no-sandbox','--disable-dev-shm-usage']});
+const p = await b.newPage({viewport:{width:640,height:400}});
+p.on('pageerror', e=>console.error('PAGEERROR', e.message));
+p.on('console', m=>{ if(m.type()==='error') console.error('CONSOLE', m.text()); });
+await p.goto('http://localhost:8299/tools/webgl-smoke.html',{waitUntil:'networkidle'});
+await p.waitForFunction(()=>window.__SMOKE__, null, {timeout:30000}).catch(()=>{});
+console.log('smoke:', JSON.stringify(await p.evaluate(()=>window.__SMOKE__||null)));
+await p.screenshot({path:'/tmp/claude-0/-home-user-rfs2-2/fc12df77-6d72-5162-8678-2a6b4bbb6cb7/scratchpad/smoke.png'});
+await b.close(); s.kill();

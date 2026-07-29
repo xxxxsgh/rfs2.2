@@ -1,0 +1,18 @@
+<!doctype html><meta charset=utf-8>
+<script type="importmap">{"imports":{"three":"../vendor/three/build/three.module.js"}}</script>
+<body style="margin:0;overflow:hidden">
+<script type="module">
+import * as THREE from 'three';
+const r = new THREE.WebGLRenderer({antialias:false, logarithmicDepthBuffer:true, preserveDrawingBuffer:true});
+r.setSize(innerWidth, innerHeight); document.body.appendChild(r.domElement);
+const sc = new THREE.Scene(); sc.background = new THREE.Color(0x102040);
+const cam = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1000); cam.position.z = 4;
+const m = new THREE.Mesh(new THREE.IcosahedronGeometry(1.4,3), new THREE.MeshStandardMaterial({color:0xff8a3d, roughness:0.35, metalness:0.2}));
+sc.add(m); sc.add(new THREE.DirectionalLight(0xffffff,3).translateX(3).translateY(4));
+sc.add(new THREE.AmbientLight(0x4488ff,0.6));
+// alvo HDR half-float — é o que o engine usa
+const rt = new THREE.WebGLRenderTarget(256,256,{type:THREE.HalfFloatType});
+r.setRenderTarget(rt); r.render(sc,cam); r.setRenderTarget(null);
+r.render(sc,cam);
+window.__SMOKE__ = { webgl2: r.capabilities.isWebGL2, halfFloat: r.extensions.has('EXT_color_buffer_float'), maxTex: r.capabilities.maxTextureSize };
+</script>
