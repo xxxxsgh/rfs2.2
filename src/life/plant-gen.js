@@ -961,7 +961,7 @@ GEN.mushroom_cap = (mb, rng, pal, P, L, H) => {
 };
 
 GEN.tendril = (mb, rng, pal, P, L, H) => {
-  const n = rng.intRange(2, 4);
+  const n = Math.max(1, Math.round(rng.intRange(2, 4) * (0.4 + 0.6 * L.cards)));
   for (let i = 0; i < n; i++) {
     const az = rng.float() * Math.PI * 2;
     const segs = Math.max(4, L.seg * 3);

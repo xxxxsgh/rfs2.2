@@ -170,6 +170,11 @@ export const SCATTERING_CHUNK = /* glsl */`
 
 uniform sampler2D uAtmoTrans;    // LUT de transmitância  (256x64)
 uniform sampler2D uAtmoMulti;    // LUT de multi-espalhamento (32x32)
+uniform sampler2D uSkyView;      // LUT de céu do frame (direção → in-scattering)
+uniform vec4  uSkyGeom;          // x=r da câmera  y=theta do horizonte  z=theta do topo (<0 se dentro)
+uniform vec3  uSkyUp;            // zênite local da câmera
+uniform vec3  uSkySunRef;        // tangente na direção azimutal do sol
+uniform vec3  uSkySide;          // uSkyUp x uSkySunRef
 uniform vec4  uAtmoGeom;         // x=1.0(R)  y=topo/R  z=hR(m)  w=hM(m)
 uniform float uAtmoRadius;       // raio do planeta em metros
 uniform vec3  uAtmoBetaR;        // Rayleigh, por unidade de raio
