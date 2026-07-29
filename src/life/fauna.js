@@ -911,6 +911,12 @@ function updateFeet(c, dt, ctx, body, s, stride) {
   for (let i = 0; i < rig.legs.length; i++) {
     const L = rig.legs[i], st = c.legs[i];
     const t = ((c.gaitPhase + L.phase) % 1 + 1) % 1;
+    const maxReach = (L.upperLen + L.lowerLen) * s * 1.15;
+    if (st.stance && Math.sqrt(st.footWorld.distanceToSq(c.pos)) > maxReach + tr.sizeM * 0.5) {
+      replant(c, ctx, body, L, st, s, 0);
+      st.fromWorld.copy(st.toWorld);
+      st.footWorld.copy(st.toWorld);
+    }
     if (!moving || t < D) {
       if (!st.stance) { st.stance = true; st.footWorld.copy(st.toWorld); }
       st.lift = 0;
@@ -919,13 +925,7 @@ function updateFeet(c, dt, ctx, body, s, stride) {
         st.stance = false;
         st.fromWorld.copy(st.footWorld);
         // Próximo apoio: projeção do quadril à frente, meia passada, no chão.
-        const ahead = stride * 0.5 + c.speed * 0.16;
-        st.toWorld.set(
-          c.pos.x + _right.x * L.restFoot.x * s + c.fwd.x * (L.restFoot.z * s + ahead),
-          c.pos.y + _right.y * L.restFoot.x * s + c.fwd.y * (L.restFoot.z * s + ahead),
-          c.pos.z + _right.z * L.restFoot.x * s + c.fwd.z * (L.restFoot.z * s + ahead),
-        );
-        snapToGround(ctx, body, st.toWorld);
+        replant(c, ctx, body, L, st, s, stride * 0.5 + c.speed * 0.16);
       }
       const u = clamp((t - D) / (1 - D), 0, 1);
       const e = u * u * (3 - 2 * u);
