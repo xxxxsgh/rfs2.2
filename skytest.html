@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>sky harness</title>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three/build/three.module.js", "three/addons/": "./vendor/three/addons/" } }
+</script>
+</head>
+<body style="margin:0;background:#000">
+<div id="glwrap"></div>
+<script type="module">
+import * as THREE from 'three';
+import { createContext, Vec3d } from './src/core/context.js';
+import * as sky from './src/atmo/sky.js';
+import { BIOMES } from './src/planet/biomes.js';
+
+window.__RESULT__ = { errors: [], log: [] };
+const L = (s) => window.__RESULT__.log.push(s);
+
+function half2f(h) {
+  const s = (h & 0x8000) ? -1 : 1;
+  const e = (h & 0x7C00) >> 10;
+  const f = h & 0x03FF;
+  if (e === 0) return s * Math.pow(2, -14) * (f / 1024);
+  if (e === 31) return f ? NaN : s * Infinity;
+  return s * Math.pow(2, e - 15) * (1 + f / 1024);
+}
+
+function readRT(renderer, rt, x, y, w, h) {
+  const type = rt.texture.type;
+  if (type === THREE.HalfFloatType) {
+    const b = new Uint16Array(w * h * 4);
+    renderer.readRenderTargetPixels(rt, x, y, w, h, b);
+    const o = new Float32Array(w * h * 4);
+    for (let i = 0; i < b.length; i++) o[i] = half2f(b[i]);
+    return o;
+  }
+  if (type === THREE.FloatType) {
+    const b = new Float32Array(w * h * 4);
+    renderer.readRenderTargetPixels(rt, x, y, w, h, b);
+    return b;
+  }
+  const b = new Uint8Array(w * h * 4);
+  renderer.readRenderTargetPixels(rt, x, y, w, h, b);
+  const o = new Float32Array(w * h * 4);
+  for (let i = 0; i < b.length; i++) o[i] = b[i] / 255;
+  return o;
+}
+
+const R = 150000;
+const body = {
+  id: 'p0', name: 'Teste', type: 'planet', radius: R, seed: 12345,
+  center: new Vec3d(0, 0, 0),
+  biome: BIOMES.find((b) => b.id === 'lush_verdant'),
+};
+
+async function run() {
+  const ctx = createContext({ container: document.getElementById('glwrap'), seed: 'T', quality: 'high' });
+  ctx.planet = { current: body, fogUniforms: {
+    uFogColor: { value: new THREE.Color() },
+    uFogDensity: { value: 0 },
+    uSunDir: { value: new THREE.Vector3() },
+    uSunColor: { value: new THREE.Color() },
+  } };
+  ctx.system = {
+    star: { class: 'G', color: 0xfff4e8, radius: 6.96e8, temp: 5800, luminosity: 1,
+            position: new Vec3d(1.2e9, 0, 0) },
+  };
+  ctx.player.position.set(0, R + 1.7, 0);
+
+  await sky.init(ctx);
+  const rr = ctx.engine.renderer;
+  L('init ok. atmoTop=' + ctx.sky.atmosphereThickness + '  hdrType=' + ctx.engine.hdrType
+    + '  lutType=' + ctx.sky.transmittanceLUT.type);
+
+  // ── LUT de transmitância ───────────────────────────────────────────────────
+  const lut = readRT(rr, sky.__luts().transTarget, 0, 0, 256, 64);
+  const at = (u, v) => {
+    const x = Math.min(255, Math.floor(u * 256)), y = Math.min(63, Math.floor(v * 64));
+    const i = (y * 256 + x) * 4;
+    return [lut[i], lut[i + 1], lut[i + 2]].map((n) => n.toFixed(4)).join(',');
+  };
+  L('transLUT  zenite(solo)=' + at(0.02, 0.01) + '  45deg=' + at(0.35, 0.01)
+    + '  horizonte=' + at(0.98, 0.01) + '  topo/zenite=' + at(0.02, 0.99)
+    + '  meio=' + at(0.5, 0.5));
+
+  const mlut = readRT(rr, sky.__luts().multiTarget, 0, 0, 32, 32);
+  const mat = (u, v) => {
+    const x = Math.min(31, Math.floor(u * 32)), y = Math.min(31, Math.floor(v * 32));
+    const i = (y * 32 + x) * 4;
+    return [mlut[i], mlut[i + 1], mlut[i + 2]].map((n) => n.toFixed(5)).join(',');
+  };
+  L('multiLUT  sol-zenite(solo)=' + mat(0.99, 0.01) + '  sol-horiz(solo)=' + mat(0.5, 0.01)
+    + '  sol-abaixo=' + mat(0.2, 0.01) + '  sol-zenite(topo)=' + mat(0.99, 0.95));
+
+  // ── Cenários ───────────────────────────────────────────────────────────────
+  const cases = [
+    ['solo-manha', 0.33, R + 1.7],
+    ['solo-poente', 0.755, R + 2.2],
+    ['solo-noite', 0.02, R + 1.7],
+    ['orbita-baixa', 0.42, R + R * 0.42],
+  ];
+
+  for (const [name, t, dist] of cases) {
+    ctx.player.position.set(0, dist, 0);
+    ctx.frame.rebaseTo(ctx.player.position);
+    ctx.sky.setTimeOfDay(t);
+    sky.update(0.016, ctx);
+    sky.lateUpdate(0.016, ctx);
+
+    const sd = ctx.sky.sunDirection;
+    const cam = ctx.engine.camera;
+    cam.position.set(0, 0, 0);
+    cam.up.set(0, 1, 0);
+    if (name.startsWith('orbita')) cam.lookAt(1, -0.34, 0);
+    else cam.lookAt(sd.x, 0.10, sd.z);
+    ctx.engine.renderToTarget(ctx.engine.sceneTarget);
+
+    const w = ctx.engine.sceneTarget.width, h = ctx.engine.sceneTarget.height;
+    const px = readRT(rr, ctx.engine.sceneTarget, 0, 0, w, h);
+    const sample = (u, v) => {
+      const i = ((Math.floor(v * h) * w) + Math.floor(u * w)) * 4;
+      return [px[i], px[i + 1], px[i + 2]].map((n) => n.toFixed(4)).join(',');
+    };
+    const s = ctx.sky;
+    L(name + ' | I=' + s.sunIntensity.toFixed(2)
+      + ' sunCol=' + [s.sunColor.r, s.sunColor.g, s.sunColor.b].map((v) => v.toFixed(2)).join(',')
+      + ' | topo=' + [s.ambientTop.r, s.ambientTop.g, s.ambientTop.b].map((v) => v.toFixed(3)).join(',')
+      + ' | px meio=' + sample(0.5, 0.5)
+      + ' | px alto=' + sample(0.5, 0.9)
+      + ' | px baixo=' + sample(0.5, 0.12)
+      + ' | px esq=' + sample(0.08, 0.5)
+      + ' | px dir=' + sample(0.92, 0.5));
+  }
+
+  window.__RESULT__.done = true;
+}
+
+window.addEventListener('error', (e) => { window.__RESULT__.errors.push(String(e.message)); });
+run().catch((e) => { window.__RESULT__.errors.push(String(e && e.stack || e)); window.__RESULT__.done = true; });
+</script>
+</body>
+</html>
