@@ -69,6 +69,7 @@ const _mBasis = new THREE.Matrix4();
 const _p1 = new Vec3d();
 const _p2 = new Vec3d();
 const _probe = new Vec3d();
+const _footRef = new Vec3d();
 
 // ── Estado do módulo ────────────────────────────────────────────────────────
 let ctxRef = null;
@@ -934,8 +935,15 @@ function updateFeet(c, dt, ctx, body, s, stride) {
   for (let i = 0; i < rig.legs.length; i++) {
     const L = rig.legs[i], st = c.legs[i];
     const t = ((c.gaitPhase + L.phase) % 1 + 1) % 1;
-    const maxReach = (L.upperLen + L.lowerLen) * s * 1.15;
-    if (st.stance && Math.sqrt(st.footWorld.distanceToSq(c.pos)) > maxReach + tr.sizeM * 0.5) {
+    // Coleira do apoio: se o pé se afastou demais do lugar NOMINAL sob o
+    // quadril (giro brusco, rebase, retorno de LOD), replanta em vez de deixar
+    // a IK esticar a perna até o limite e falhar.
+    _footRef.set(
+      c.pos.x + _right.x * L.restFoot.x * s + c.fwd.x * L.restFoot.z * s,
+      c.pos.y + _right.y * L.restFoot.x * s + c.fwd.y * L.restFoot.z * s,
+      c.pos.z + _right.z * L.restFoot.x * s + c.fwd.z * L.restFoot.z * s,
+    );
+    if (st.stance && st.footWorld.distanceToSq(_footRef) > (stride * 1.25 + tr.sizeM * 0.2) ** 2) {
       replant(c, ctx, body, L, st, s, 0);
       st.fromWorld.copy(st.toWorld);
       st.footWorld.copy(st.toWorld);

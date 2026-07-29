@@ -105,6 +105,7 @@ const S = {
   dayLength: DEFAULT_DAY_LENGTH,
 
   uniforms: null,
+  skyViewMat: null,
   shellGeom: null,
   shellT: null,        // passe multiplicativo (transmitância)
   shellS: null,        // passe aditivo (in-scattering)
@@ -435,6 +436,48 @@ export function lateUpdate(dt, ctx) {
   placeSun(S.sunMesh, S.sunUniforms, S.sunDirection, S.starDisc, S.sunAngular, S.sunDiscScale);
   if (S.sunMesh2.visible) {
     placeSun(S.sunMesh2, S.sunUniforms2, S.sunDirection2, S.starDisc2, S.sunAngular2, S.sunDiscScale2);
+  }
+}
+
+/**
+ * Prepara o referencial da LUT de céu e a redesenha.
+ * O par (zênite da câmera, azimute do sol) é o sistema em que o in-scattering
+ * é função de apenas duas variáveis — daí a LUT ser 2D.
+ */
+function updateSkyView(ctx) {
+  const p = S.params;
+  const cam = ctx.engine.camera;
+
+  // Câmera relativa ao centro do planeta, em unidades de raio.
+  _tmpA.copy(cam.position).sub(_centerLocal);
+  const dist = _tmpA.length();
+  const rN = Math.max(p.groundR + 1e-6, dist / p.radius);
+  _tmpA.multiplyScalar(1 / Math.max(dist, 1e-6));
+
+  // Tangente ao solo e tangente ao topo da atmosfera, medidas do zênite.
+  const thetaH = Math.PI - Math.asin(clamp(p.groundR / rN, -1, 1));
+  const insideAtmo = p.nTop >= rN;
+  const thetaA = insideAtmo ? -1 : Math.PI - Math.asin(clamp(p.nTop / rN, -1, 1));
+
+  const u = S.uniforms;
+  u.uSkyGeom.value.set(rN, thetaH, thetaA, 0);
+  u.uSkyUp.value.copy(_tmpA);
+
+  // Referência azimutal: o sol projetado no plano tangente. Se o sol estiver no
+  // zênite exato a projeção some; aí qualquer tangente estável serve.
+  _tmpB.copy(S.sunDirection).addScaledVector(_tmpA, -S.sunDirection.dot(_tmpA));
+  if (_tmpB.lengthSq() < 1e-10) {
+    _tmpB.set(Math.abs(_tmpA.y) > 0.92 ? 1 : 0, Math.abs(_tmpA.y) > 0.92 ? 0 : 1, 0);
+    _tmpB.addScaledVector(_tmpA, -_tmpB.dot(_tmpA));
+  }
+  _tmpB.normalize();
+  u.uSkySunRef.value.copy(_tmpB);
+  u.uSkySide.value.crossVectors(_tmpA, _tmpB).normalize();
+
+  try {
+    S.luts.renderSkyView(S.skyViewMat);
+  } catch (e) {
+    ctx.debug.set('sky.erro', 'skyView: ' + (e && e.message ? e.message : e));
   }
 }
 
