@@ -114,8 +114,7 @@ const S = {
   uniforms: null,
   skyViewMat: null,
   shellGeom: null,
-  shellT: null,        // passe multiplicativo (transmitância)
-  shellS: null,        // passe aditivo (in-scattering)
+  shell: null,         // casca única: transmitância e in-scattering pré-multiplicados
   sunMesh: null,
   sunMesh2: null,
   sunUniforms: null,
@@ -394,10 +393,8 @@ export function lateUpdate(dt, ctx) {
   if (body) {
     ctx.frame.toLocal(body.center, _centerLocal);
     const rTop = S.params.top;
-    S.shellT.position.copy(_centerLocal);
-    S.shellS.position.copy(_centerLocal);
-    S.shellT.scale.setScalar(rTop);
-    S.shellS.scale.setScalar(rTop);
+    S.shell.position.copy(_centerLocal);
+    S.shell.scale.setScalar(rTop);
     S.uniforms.uPlanetCenter.value.copy(_centerLocal);
   }
 
@@ -513,8 +510,7 @@ function syncBody(ctx, force) {
   S.binaryPhase = bin.range(0.10, 0.34) * Math.PI * 2;
   S.binaryTilt = bin.range(-0.45, 0.45);
 
-  S.shellT.visible = S.hasPlanet;
-  S.shellS.visible = S.hasPlanet;
+  if (S.shell) S.shell.visible = S.hasPlanet;
 
   if (S.params && ctx.debug) ctx.debug.set('sky.atmoKm', (S.params.thickness / 1000).toFixed(1));
 }
@@ -946,8 +942,7 @@ const api = {
 };
 
 export function dispose(ctx) {
-  if (S.shellT) { ctx.engine.scene.remove(S.shellT); S.shellT.material.dispose(); }
-  if (S.shellS) { ctx.engine.scene.remove(S.shellS); S.shellS.material.dispose(); }
+  if (S.shell) { ctx.engine.scene.remove(S.shell); S.shell.material.dispose(); }
   if (S.shellGeom) S.shellGeom.dispose();
   if (S.sunMesh) { ctx.engine.farScene.remove(S.sunMesh); S.sunMesh.material.dispose(); S.sunMesh.geometry.dispose(); }
   if (S.sunMesh2) { ctx.engine.farScene.remove(S.sunMesh2); S.sunMesh2.material.dispose(); }

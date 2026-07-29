@@ -257,6 +257,7 @@ attribute float aPhase;  // fase própria da cintilação
 varying vec3  vColor;
 varying float vBright;
 
+#include <common>
 #include <logdepthbuf_pars_vertex>
 
 void main() {
@@ -312,6 +313,7 @@ void main() {
 
 const BAND_VERT = /* glsl */`
 varying vec2 vUv;
+#include <common>
 #include <logdepthbuf_pars_vertex>
 void main() {
   vUv = uv;

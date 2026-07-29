@@ -51,6 +51,9 @@ const browser = await chromium.launch({
 });
 
 const page = await browser.newPage({ viewport: { width: WIDTH, height: HEIGHT }, deviceScaleFactor: 1 });
+// O jogo roda a poucos fps sob SwiftShader; os padrões de 30 s do Playwright
+// estouram antes de o compositor entregar o frame.
+page.setDefaultTimeout(180000);
 
 const consoleErrors = [];
 const consoleWarns = [];
@@ -99,7 +102,7 @@ try {
       continue;
     }
     const file = path.join(OUT, `${name}.png`);
-    await page.screenshot({ path: file, type: 'png' });
+    await page.screenshot({ path: file, type: 'png', timeout: 180000, animations: 'disabled' });
     meta.file = path.relative(ROOT, file);
     report.shots.push(meta);
     console.log(`ok  (${meta.fps} fps, ${meta.drawCalls} draws, ${(meta.triangles / 1000).toFixed(0)}k tris, ${meta.biome || '—'})`);

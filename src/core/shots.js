@@ -222,6 +222,63 @@ export function settle(ctx, frames = 30) {
 }
 
 /**
+ * Espera a fila de geração de terreno drenar.
+ *
+ * `planet.waitReady` garante que os chunks ao redor do ponto existem, mas não
+ * que a hierarquia de LOD convergiu. Capturar antes disso produz um chão de
+ * baixa resolução que não representa o build — a auditoria visual ficaria
+ * medindo a latência do worker, não a qualidade do terreno.
+ */
+export function drainTerrain(ctx, { timeoutMs = 120000, quietFrames = 20 } = {}) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    let quiet = 0;
+    const step = () => {
+      const q = readQueue(ctx);
+      if (q <= 0) quiet++; else quiet = 0;
+      if (quiet >= quietFrames || performance.now() - t0 > timeoutMs) {
+        resolve({ queue: q, waitedMs: Math.round(performance.now() - t0) });
+        return;
+      }
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  });
+}
+
+function readQueue(ctx) {
+  const p = ctx.planet;
+  if (p && typeof p.pendingCount === 'number') return p.pendingCount;
+  if (p && typeof p.queueLength === 'number') return p.queueLength;
+  // Recurso final: a linha de debug publicada pelo módulo de terreno.
+  const line = ctx.debug?.lines?.get?.('terreno.fila');
+  const n = typeof line === 'number' ? line : parseInt(line, 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Congela o que se move sozinho durante uma captura.
+ *
+ * As órbitas avançam a `universe.timeScale` (~2000x). Os segundos que o
+ * terreno leva para transmitir equivalem a horas de movimento orbital, e o
+ * planeta simplesmente sai de baixo do jogador — que foi posicionado em
+ * coordenadas de mundo absolutas. Congelar é a única forma de a captura ser
+ * reprodutível.
+ *
+ * (No jogo isso não é problema: o módulo de voo carrega o jogador junto com o
+ * referencial do planeta enquanto ele está pousado ou em atmosfera.)
+ */
+function freezeWorld(ctx) {
+  const prev = { timeScale: ctx.universe?.timeScale };
+  if (ctx.universe && typeof ctx.universe.timeScale === 'number') ctx.universe.timeScale = 0;
+  return prev;
+}
+
+function thawWorld(ctx, prev) {
+  if (ctx.universe && prev.timeScale !== undefined) ctx.universe.timeScale = prev.timeScale;
+}
+
+/**
  * Instala `ctx.shot(name)` — chamado pelo Playwright.
  * Devolve metadados úteis para o relatório do crítico.
  */
@@ -230,17 +287,24 @@ export function installShots(ctx) {
   ctx.shot = async (name) => {
     const s = SHOTS[name];
     if (!s) throw new Error('pose desconhecida: ' + name);
-    // Congela o tempo para a captura ser reprodutível.
+    // Congela o que se move sozinho para a captura ser reprodutível.
     const prevScale = ctx.time.scale;
     ctx.time.scale = 1;
+    const prevWorld = freezeWorld(ctx);
     if (s.time !== undefined && ctx.sky?.setTimeOfDay) ctx.sky.setTimeOfDay(s.time);
     ctx.time.dayFraction = s.time ?? ctx.time.dayFraction;
 
     await s.pose(ctx);
-    await settle(ctx, 45);           // LOD, imposters e nuvens convergirem
+    // O LOD só converge depois que a fila do worker drena; sem isso a captura
+    // mede a latência do streaming em vez da qualidade do terreno.
+    const drain = await drainTerrain(ctx);
+    await settle(ctx, 45);           // imposters, nuvens e reprojeção temporal
 
     ctx.time.scale = prevScale;
+    thawWorld(ctx, prevWorld);
     return {
+      drainMs: drain.waitedMs,
+      queueLeft: drain.queue,
       shot: name,
       label: s.label,
       planet: ctx.planet?.current?.name || null,
