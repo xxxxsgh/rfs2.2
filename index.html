@@ -305,6 +305,8 @@ var defaultSave = function(){
     lastBase: 0,
     pos: null,
     muted: false,
+    fx: true,
+    invertPitch: false,
     playtime: 0
   };
 };
@@ -685,7 +687,7 @@ function engineAudio(speedNorm, boosting){
 /* =====================================================================
    4. MUNDO: RENDERER, CEU, TERRENO EM CHUNKS, PROPS, ESTRUTURAS, FAUNA
    ===================================================================== */
-var scene, camera, renderer, sunLight, hemiLight;
+var scene, camera, renderer, sunLight, hemiLight, rimLight;
 var world = {
   chunks:{}, queue:[], queued:{}, time: DAY_LENGTH*0.25, currentBiome:0,
   pois:[], resources:[], structures:[], dayFactor:1, skyMesh:null,
@@ -700,7 +702,7 @@ function initRenderer(){
   document.getElementById("glwrap").appendChild(renderer.domElement);
 
   scene = new THREE.Scene();
-  scene.fog = new THREE.Fog(0x8fb6ff, CHUNK*0.9, FOG_FAR);
+  scene.fog = new THREE.Fog(0x8fb6ff, CHUNK*1.5, FOG_FAR);
   camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.6, 9000);
 
   hemiLight = new THREE.HemisphereLight(0xbcd8ff, 0x40302a, 0.85);
@@ -708,8 +710,178 @@ function initRenderer(){
   sunLight = new THREE.DirectionalLight(0xfff0d0, 1.05);
   sunLight.position.set(200,400,120);
   scene.add(sunLight);
+  // luz de preenchimento fria, ajuda a dar volume as faces em sombra
+  rimLight = new THREE.DirectionalLight(0x5ea8ff, 0.42);
+  rimLight.position.set(-260, 120, -300);
+  scene.add(rimLight);
 
   buildSky();
+  initPostFX();
+}
+
+/* ---------------------------------------------------------------------
+   POS PROCESSAMENTO: brilho (bloom), tonemap filmico, vinheta e
+   distorcao de velocidade. Feito a mao com WebGLRenderTarget porque a
+   build minima do three nao traz o EffectComposer.
+   --------------------------------------------------------------------- */
+var postfx = {
+  on:true, ready:false, rtScene:null, rtA:null, rtB:null,
+  scene:null, cam:null, quad:null, mBright:null, mBlur:null, mFinal:null,
+  aberration:0, warp:0
+};
+
+var FX_VERT = [
+  "varying vec2 vUv;",
+  "void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }"
+].join("\n");
+
+var FX_BRIGHT = [
+  "uniform sampler2D tDiffuse;",
+  "uniform float uThreshold;",
+  "varying vec2 vUv;",
+  "void main(){",
+  "  vec3 c = texture2D(tDiffuse, vUv).rgb;",
+  "  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));",
+  "  float k = smoothstep(uThreshold, uThreshold + 0.45, l);",
+  "  gl_FragColor = vec4(c * k, 1.0);",
+  "}"
+].join("\n");
+
+var FX_BLUR = [
+  "uniform sampler2D tDiffuse;",
+  "uniform vec2 uDir;",
+  "varying vec2 vUv;",
+  "void main(){",
+  "  vec3 sum = texture2D(tDiffuse, vUv).rgb * 0.2270270270;",
+  "  sum += texture2D(tDiffuse, vUv + uDir * 1.3846153846).rgb * 0.3162162162;",
+  "  sum += texture2D(tDiffuse, vUv - uDir * 1.3846153846).rgb * 0.3162162162;",
+  "  sum += texture2D(tDiffuse, vUv + uDir * 3.2307692308).rgb * 0.0702702703;",
+  "  sum += texture2D(tDiffuse, vUv - uDir * 3.2307692308).rgb * 0.0702702703;",
+  "  gl_FragColor = vec4(sum, 1.0);",
+  "}"
+].join("\n");
+
+var FX_FINAL = [
+  "uniform sampler2D tScene;",
+  "uniform sampler2D tBloom;",
+  "uniform float uBloom;",
+  "uniform float uAberration;",
+  "uniform float uWarp;",
+  "uniform float uExposure;",
+  "uniform float uSaturation;",
+  "uniform float uContrast;",
+  "varying vec2 vUv;",
+  "vec3 aces(vec3 x){",
+  "  return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0);",
+  "}",
+  "void main(){",
+  "  vec2 c = vUv - 0.5;",
+  "  float r2 = dot(c, c);",
+  "  vec2 uv = vUv + c * r2 * uWarp;",           // distorcao radial no boost
+  "  float ab = uAberration * (0.6 + r2 * 3.0);",
+  "  vec3 col;",
+  "  col.r = texture2D(tScene, uv + c * ab).r;",
+  "  col.g = texture2D(tScene, uv).g;",
+  "  col.b = texture2D(tScene, uv - c * ab).b;",
+  "  col += texture2D(tBloom, uv).rgb * uBloom;",
+  "  col = aces(col * uExposure);",
+  "  float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));",
+  "  col = mix(vec3(lum), col, uSaturation);",
+  "  col = clamp((col - 0.5) * uContrast + 0.5, 0.0, 1.0);",
+  "  col *= smoothstep(1.35, 0.28, r2 * 2.0);",  // vinheta suave
+  "  gl_FragColor = vec4(pow(col, vec3(1.0/2.2)), 1.0);",
+  "}"
+].join("\n");
+
+function initPostFX(){
+  postfx.on = save.fx !== false;
+  postfx.scene = new THREE.Scene();
+  postfx.cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  postfx.mBright = new THREE.ShaderMaterial({
+    uniforms:{ tDiffuse:{ value:null }, uThreshold:{ value:0.86 } },
+    vertexShader:FX_VERT, fragmentShader:FX_BRIGHT, depthTest:false, depthWrite:false });
+  postfx.mBlur = new THREE.ShaderMaterial({
+    uniforms:{ tDiffuse:{ value:null }, uDir:{ value:new THREE.Vector2(0,0) } },
+    vertexShader:FX_VERT, fragmentShader:FX_BLUR, depthTest:false, depthWrite:false });
+  postfx.mFinal = new THREE.ShaderMaterial({
+    uniforms:{
+      tScene:{ value:null }, tBloom:{ value:null },
+      uBloom:{ value:0.52 }, uAberration:{ value:0 }, uWarp:{ value:0 }, uExposure:{ value:0.94 },
+      uSaturation:{ value:1.24 }, uContrast:{ value:1.07 }
+    },
+    vertexShader:FX_VERT, fragmentShader:FX_FINAL, depthTest:false, depthWrite:false });
+  postfx.quad = new THREE.Mesh(new THREE.PlaneGeometry(2,2), postfx.mFinal);
+  postfx.quad.frustumCulled = false;
+  postfx.scene.add(postfx.quad);
+  resizePostFX();
+  postfx.ready = true;
+}
+
+function resizePostFX(){
+  var size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  // limita a resolucao interna dos efeitos: em telas retina grandes o custo
+  // dos alvos de render dobraria sem ganho visivel
+  var maxPix = 2600000;
+  var f = Math.min(1, Math.sqrt(maxPix/Math.max(1, size.x*size.y)));
+  var w = Math.max(2, Math.floor(size.x*f)), h = Math.max(2, Math.floor(size.y*f));
+  var hw = Math.max(2, Math.floor(w/2)), hh = Math.max(2, Math.floor(h/2));
+  if(postfx.rtScene){ postfx.rtScene.dispose(); postfx.rtA.dispose(); postfx.rtB.dispose(); }
+  var opt = { minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter,
+              format:THREE.RGBAFormat, type:THREE.UnsignedByteType, stencilBuffer:false };
+  postfx.rtScene = new THREE.WebGLRenderTarget(w, h, opt);
+  postfx.rtScene.depthBuffer = true;
+  var opt2 = { minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter,
+               format:THREE.RGBAFormat, type:THREE.UnsignedByteType, stencilBuffer:false, depthBuffer:false };
+  postfx.rtA = new THREE.WebGLRenderTarget(hw, hh, opt2);
+  postfx.rtB = new THREE.WebGLRenderTarget(hw, hh, opt2);
+  postfx.halfW = hw; postfx.halfH = hh;
+}
+
+function setFxEnabled(on){
+  save.fx = !!on;
+  postfx.on = !!on;
+  writeSave();
+}
+
+function renderFrame(dt){
+  if(!postfx.on || !postfx.ready){
+    renderer.setRenderTarget(null);
+    renderer.render(scene, camera);
+    return;
+  }
+  // alvo de efeitos ligados ao boost
+  var boostAmt = ship && ship.boosting ? 1 : 0;
+  var over = ship ? clamp(ship.speed/Math.max(ship.stats.maxSpeed,1) - 0.9, 0, 0.8) : 0;
+  postfx.aberration = damp(postfx.aberration, boostAmt*0.0045 + over*0.004, 6, dt||0.016);
+  postfx.warp = damp(postfx.warp, boostAmt*0.10 + over*0.06, 5, dt||0.016);
+  postfx.mFinal.uniforms.uAberration.value = postfx.aberration;
+  postfx.mFinal.uniforms.uWarp.value = postfx.warp;
+
+  renderer.setRenderTarget(postfx.rtScene);
+  renderer.clear();
+  renderer.render(scene, camera);
+
+  postfx.quad.material = postfx.mBright;
+  postfx.mBright.uniforms.tDiffuse.value = postfx.rtScene.texture;
+  renderer.setRenderTarget(postfx.rtA);
+  renderer.render(postfx.scene, postfx.cam);
+
+  postfx.quad.material = postfx.mBlur;
+  postfx.mBlur.uniforms.tDiffuse.value = postfx.rtA.texture;
+  postfx.mBlur.uniforms.uDir.value.set(1/postfx.halfW, 0);
+  renderer.setRenderTarget(postfx.rtB);
+  renderer.render(postfx.scene, postfx.cam);
+
+  postfx.mBlur.uniforms.tDiffuse.value = postfx.rtB.texture;
+  postfx.mBlur.uniforms.uDir.value.set(0, 1/postfx.halfH);
+  renderer.setRenderTarget(postfx.rtA);
+  renderer.render(postfx.scene, postfx.cam);
+
+  postfx.quad.material = postfx.mFinal;
+  postfx.mFinal.uniforms.tScene.value = postfx.rtScene.texture;
+  postfx.mFinal.uniforms.tBloom.value = postfx.rtA.texture;
+  renderer.setRenderTarget(null);
+  renderer.render(postfx.scene, postfx.cam);
 }
 
 /* ---------- ceu, estrelas, luas, nebulosa ---------- */
@@ -754,26 +926,68 @@ function buildSky(){
   world.stars.frustumCulled = false;
   scene.add(world.stars);
 
-  // luas
+  // luas iluminadas pelo sol, com fases visiveis
   var moonDefs = [
     { r:190, dist:3200, color:0xffe6c4, tilt:0.4, speed:0.9 },
     { r:110, dist:3000, color:0xc4d8ff, tilt:-0.7, speed:1.5 }
   ];
   for(var m=0;m<2;m++){
     var d = moonDefs[m];
-    var mm = new THREE.Mesh(new THREE.SphereGeometry(d.r, 16, 12),
-      new THREE.MeshBasicMaterial({ color:d.color, fog:false }));
+    var mm = new THREE.Mesh(new THREE.SphereGeometry(d.r, 20, 14),
+      new THREE.MeshPhongMaterial({ color:d.color, emissive:d.color, emissiveIntensity:0.12,
+        shininess:2, fog:false, flatShading:false }));
     mm.userData = d;
     mm.frustumCulled = false;
     scene.add(mm);
     world.moons.push(mm);
   }
 
-  // sol
-  world.sunMesh = new THREE.Mesh(new THREE.SphereGeometry(150,16,12),
-    new THREE.MeshBasicMaterial({ color:0xfff2c0, fog:false }));
+  // gigante gasoso com anel, sempre no mesmo ponto do ceu
+  var giant = new THREE.Group();
+  var gm = new THREE.Mesh(new THREE.SphereGeometry(430, 24, 18),
+    new THREE.MeshPhongMaterial({ color:0xd8a05a, emissive:0x2a1608, shininess:5, fog:false }));
+  giant.add(gm);
+  var gring = new THREE.Mesh(new THREE.RingGeometry(560, 830, 64),
+    new THREE.MeshBasicMaterial({ color:0xe6c79a, transparent:true, opacity:0.36,
+      side:THREE.DoubleSide, fog:false, depthWrite:false }));
+  gring.rotation.x = -Math.PI/2.25;
+  gring.rotation.z = 0.4;
+  giant.add(gring);
+  giant.frustumCulled = false;
+  scene.add(giant);
+  world.giant = giant;
+
+  // sol com brilho aditivo
+  world.sunMesh = new THREE.Mesh(new THREE.SphereGeometry(150,20,14),
+    new THREE.MeshBasicMaterial({ color:0xfff6d8, fog:false }));
   world.sunMesh.frustumCulled = false;
   scene.add(world.sunMesh);
+  world.sunGlare = new THREE.Sprite(new THREE.SpriteMaterial({
+    map:makeGlowTexture(0.28), color:0xffe9b0, transparent:true, opacity:0.9,
+    blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false, fog:false }));
+  world.sunGlare.scale.set(1900,1900,1);
+  world.sunGlare.frustumCulled = false;
+  scene.add(world.sunGlare);
+}
+
+// textura radial usada em brilhos aditivos (sol, motores, nucleos)
+var _glowTexCache = {};
+function makeGlowTexture(core){
+  var key = String(core);
+  if(_glowTexCache[key]) return _glowTexCache[key];
+  var c = document.createElement("canvas");
+  c.width = c.height = 128;
+  var g = c.getContext("2d");
+  var grd = g.createRadialGradient(64,64,0,64,64,64);
+  grd.addColorStop(0, "rgba(255,255,255,1)");
+  grd.addColorStop(core || 0.18, "rgba(255,255,255,0.7)");
+  grd.addColorStop(0.5, "rgba(255,255,255,0.20)");
+  grd.addColorStop(1, "rgba(255,255,255,0)");
+  g.fillStyle = grd;
+  g.fillRect(0,0,128,128);
+  var t = new THREE.CanvasTexture(c);
+  _glowTexCache[key] = t;
+  return t;
 }
 
 var SKY_DAY   = [0.35,0.60,0.98];
@@ -791,12 +1005,17 @@ function updateSky(dt){
   world.dayFactor = day;
 
   sunLight.position.set(Math.cos(ang)*600, sunY*700, Math.sin(ang*0.6)*380);
-  sunLight.intensity = 0.15 + day*1.0;
+  sunLight.intensity = 0.18 + day*1.25;
   sunLight.color.setRGB(lerp(1,1,day), lerp(0.55,0.94,day), lerp(0.38,0.82,day));
-  hemiLight.intensity = 0.26 + day*0.66;
+  hemiLight.intensity = 0.20 + day*0.48;
   var camPos = camera.position;
   world.sunMesh.position.set(camPos.x + Math.cos(ang)*3400, camPos.y + sunY*3400, camPos.z + Math.sin(ang*0.6)*2100);
   world.sunMesh.visible = sunY > -0.25;
+  world.sunGlare.position.copy(world.sunMesh.position);
+  world.sunGlare.visible = sunY > -0.18;
+  world.sunGlare.material.opacity = clamp(0.25 + dusk*0.7, 0, 1);
+  var glareScale = 1500 + dusk*1400;
+  world.sunGlare.scale.set(glareScale, glareScale, 1);
   world.stars.material.opacity = clamp(1-day*1.9, 0, 1);
   world.stars.position.copy(camPos);
   world.skyMesh.position.copy(camPos);
@@ -805,6 +1024,10 @@ function updateSky(dt){
     var m = world.moons[i], d = m.userData;
     var a = ph*Math.PI*2*d.speed + i*2.2;
     m.position.set(camPos.x + Math.cos(a)*d.dist, camPos.y + Math.sin(a)*d.dist*0.55 + 400*d.tilt + 300, camPos.z + Math.sin(a*0.7)*d.dist*0.6);
+  }
+  if(world.giant){
+    world.giant.position.set(camPos.x - 2600, camPos.y + 1250, camPos.z - 2400);
+    world.giant.rotation.y += dt*0.01;
   }
 
   _skyTimer -= dt;
@@ -830,7 +1053,7 @@ function updateSky(dt){
     }
     attr.needsUpdate = true;
     var fogC = scene.fog.color;
-    fogC.setRGB(clamp(r*0.95,0,1), clamp(g*0.95,0,1), clamp(b*0.95,0,1));
+    fogC.setRGB(clamp(r*0.72,0,1), clamp(g*0.74,0,1), clamp(b*0.82,0,1));
     renderer.setClearColor(fogC, 1);
   }
 }
@@ -1311,62 +1534,138 @@ function shipStats(){
   };
 }
 
+/* Nave inspirada em cacas exploradores: casco creme, paineis alaranjados,
+   anel octogonal com nucleo brilhante e naceles de plasma ciano. */
 function buildShipMesh(){
   var g = new THREE.Group();
   var u = save.upgrades;
-  var hull = new THREE.MeshPhongMaterial({ color:0xd8e6f2, flatShading:true });
-  var accentColor = [0x00f0ff,0x00f0ff,0x5cff9d,0xffd24d,0xff2fd0,0xff2fd0][clamp(6-save.rank,0,5)];
-  var accent = new THREE.MeshPhongMaterial({ color:accentColor, emissive:accentColor, emissiveIntensity:0.4, flatShading:true });
-  var glass = new THREE.MeshPhongMaterial({ color:0x0d2436, emissive:0x113a55, transparent:true, opacity:0.9, flatShading:true });
+  var s, e;
 
-  var body = new THREE.Mesh(new THREE.ConeGeometry(1.6, 7, 6), hull);
-  body.rotation.x = -Math.PI/2; g.add(body);
-  var belly = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.9, 4.2), hull);
-  belly.position.set(0,-0.6,0.6); g.add(belly);
-  var cock = new THREE.Mesh(new THREE.SphereGeometry(1.05, 8, 6), glass);
-  cock.position.set(0, 0.55, -0.4); cock.scale.set(1,0.7,1.5); g.add(cock);
+  var rankGlow = [0x36e8ff, 0x36e8ff, 0x4dffb0, 0xffd24d, 0xff8a3c, 0xff3ad2];
+  var glowColor = rankGlow[clamp(6-save.rank, 0, 5)];
 
-  // asas crescem com manobrabilidade
-  var wingSpan = 2.4 + (u.handling-1)*0.85;
-  for(var s=-1;s<=1;s+=2){
-    var wing = new THREE.Mesh(new THREE.BoxGeometry(wingSpan, 0.3, 2.6), hull);
-    wing.position.set(s*(wingSpan/2+0.9), -0.1, 0.9);
-    wing.rotation.z = s*0.12; wing.rotation.y = s*0.18;
+  var hull   = new THREE.MeshPhongMaterial({ color:0xe2dbca, specular:0x555555, shininess:34, flatShading:true });
+  var hullLo = new THREE.MeshPhongMaterial({ color:0xb4ad9e, specular:0x333333, shininess:22, flatShading:true });
+  var dark   = new THREE.MeshPhongMaterial({ color:0x272c34, specular:0x666666, shininess:52, flatShading:true });
+  var panel  = new THREE.MeshPhongMaterial({ color:0xd8442a, emissive:0x40100a, shininess:18, flatShading:true });
+  var glass  = new THREE.MeshPhongMaterial({ color:0x0b2130, emissive:0x0e4460, specular:0xaaddff,
+                                             shininess:120, transparent:true, opacity:0.92, flatShading:true });
+  var glowM  = new THREE.MeshBasicMaterial({ color:glowColor, transparent:true, opacity:0.95,
+                                             blending:THREE.AdditiveBlending, depthWrite:false });
+
+  function sprite(scale, color, op){
+    var sp = new THREE.Sprite(new THREE.SpriteMaterial({ map:makeGlowTexture(0.2), color:color,
+      transparent:true, opacity:op, blending:THREE.AdditiveBlending, depthWrite:false }));
+    sp.scale.set(scale, scale, 1);
+    return sp;
+  }
+
+  // ---- fuselagem ----
+  var nose = new THREE.Mesh(new THREE.ConeGeometry(0.95, 4.2, 7), hull);
+  nose.rotation.x = -Math.PI/2; nose.position.z = -3.6; g.add(nose);
+  var body = new THREE.Mesh(new THREE.CylinderGeometry(0.95, 1.15, 5.2, 7), hull);
+  body.rotation.x = Math.PI/2; body.position.z = 0.4; g.add(body);
+  var tail = new THREE.Mesh(new THREE.CylinderGeometry(1.15, 0.62, 1.5, 7), hullLo);
+  tail.rotation.x = Math.PI/2; tail.position.z = 3.5; g.add(tail);
+  var exhaust = new THREE.Mesh(new THREE.CircleGeometry(0.58, 7), glowM);
+  exhaust.position.z = 4.34; g.add(exhaust);
+  var exhaustGlow = sprite(2.2, glowColor, 0.5);
+  exhaustGlow.position.z = 4.4; g.add(exhaustGlow);
+  var spine = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 5.4), panel);
+  spine.position.set(0, 0.95, 0.6); g.add(spine);
+
+  // cabine
+  var cock = new THREE.Mesh(new THREE.SphereGeometry(0.95, 10, 7), glass);
+  cock.position.set(0, 0.62, -1.5); cock.scale.set(1, 0.72, 1.7); g.add(cock);
+
+  // ---- anel octogonal com nucleo de energia ----
+  var ring = new THREE.Mesh(new THREE.TorusGeometry(2.55, 0.4, 4, 8), hull);
+  ring.position.z = 1.5; ring.rotation.z = Math.PI/8; g.add(ring);
+  var ringIn = new THREE.Mesh(new THREE.TorusGeometry(2.2, 0.12, 4, 8), glowM);
+  ringIn.position.z = 1.5; ringIn.rotation.z = Math.PI/8; g.add(ringIn);
+  for(s=-1;s<=1;s+=2){
+    var strut = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.34, 0.7), hullLo);
+    strut.position.set(s*1.85, 0, 1.5); g.add(strut);
+  }
+  var coreGlow = sprite(3.0, glowColor, 0.5);
+  coreGlow.position.z = 1.5; g.add(coreGlow);
+
+  // ---- asas enflechadas, crescem com manobrabilidade ----
+  var span = 3.1 + (u.handling-1)*0.75;
+  for(s=-1;s<=1;s+=2){
+    var wing = new THREE.Mesh(new THREE.BoxGeometry(span, 0.26, 3.0), hull);
+    wing.position.set(s*(span*0.5 + 1.5), 0.05, 0.9);
+    wing.rotation.y = s*0.30; wing.rotation.z = -s*0.06;
     g.add(wing);
-    var tip = new THREE.Mesh(new THREE.BoxGeometry(0.4,0.9,1.6), accent);
-    tip.position.set(s*(wingSpan+0.8), 0.2, 1.2); g.add(tip);
+
+    var mark = new THREE.Mesh(new THREE.BoxGeometry(span*0.34, 0.32, 1.15), panel);
+    mark.position.set(s*(span*0.42 + 1.4), 0.12, 0.0);
+    mark.rotation.y = s*0.30;
+    g.add(mark);
+
+    var fin = new THREE.Mesh(new THREE.BoxGeometry(0.22, 1.7, 1.5), dark);
+    fin.position.set(s*(span + 1.5), 0.75, 1.5);
+    fin.rotation.y = s*0.30;
+    g.add(fin);
+    var finTip = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.55, 0.9), panel);
+    finTip.position.set(s*(span + 1.5), 1.5, 1.3);
+    finTip.rotation.y = s*0.30;
+    g.add(finTip);
+
+    var light = new THREE.Mesh(new THREE.SphereGeometry(0.18, 6, 5), glowM);
+    light.position.set(s*(span + 1.5), 0.05, -0.3); g.add(light);
   }
-  // motores extras conforme nivel do motor
-  ship = ship || {};
+  // estabilizador vertical
+  var vfin = new THREE.Mesh(new THREE.BoxGeometry(0.24, 1.9, 1.9), hullLo);
+  vfin.position.set(0, 1.5, 3.0); g.add(vfin);
+
+  // ---- naceles de plasma ----
   var engines = [];
-  var nEng = Math.min(4, 1 + Math.floor((u.engine-1)/1.5) + (u.boost>=4?1:0));
-  for(var e=0;e<nEng;e++){
-    var side = (e%2===0) ? -1 : 1;
-    var lane = Math.floor(e/2);
-    var ex = (nEng===1) ? 0 : side*(1.0 + lane*1.5);
-    var pod = new THREE.Mesh(new THREE.CylinderGeometry(0.62,0.78,2.2,6), hull);
-    pod.rotation.x = Math.PI/2;
-    pod.position.set(ex, -0.15 - lane*0.15, 3.6);
-    g.add(pod);
-    var flame = new THREE.Mesh(new THREE.ConeGeometry(0.55, 2.6, 6),
-      new THREE.MeshBasicMaterial({ color:0x8ff6ff, transparent:true, opacity:0.85 }));
-    flame.rotation.x = Math.PI/2;
-    flame.position.set(ex, -0.15 - lane*0.15, 5.9);
-    g.add(flame);
-    engines.push(flame);
+  var nEng = 2 + (u.engine >= 3 ? 2 : 0) + (u.boost >= 4 ? 1 : 0);
+  var slots = [
+    [-1.85, -0.55, 1.4], [1.85, -0.55, 1.4],
+    [-3.55, -0.15, 1.9], [3.55, -0.15, 1.9],
+    [0, -0.95, 2.2]
+  ];
+  for(e=0; e<nEng && e<slots.length; e++){
+    var px = slots[e][0], py = slots[e][1], pz = slots[e][2];
+    var pod = new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.72, 3.4, 8), dark);
+    pod.rotation.x = Math.PI/2; pod.position.set(px, py, pz); g.add(pod);
+    var lip = new THREE.Mesh(new THREE.TorusGeometry(0.66, 0.1, 4, 10), hullLo);
+    lip.position.set(px, py, pz + 1.7); g.add(lip);
+
+    var bulb = new THREE.Mesh(new THREE.SphereGeometry(0.55, 10, 8), glowM);
+    bulb.position.set(px, py, pz + 1.75); g.add(bulb);
+    var plumeGeo = new THREE.ConeGeometry(0.5, 3.4, 8);
+    plumeGeo.translate(0, 1.7, 0);
+    var plume = new THREE.Mesh(plumeGeo, glowM);
+    plume.rotation.x = Math.PI/2;
+    plume.position.set(px, py, pz + 1.6); g.add(plume);
+    var halo = sprite(2.6, glowColor, 0.6);
+    halo.position.set(px, py, pz + 1.9); g.add(halo);
+
+    engines.push({ plume:plume, halo:halo, bulb:bulb });
   }
+  // luz do motor tinge o terreno em voo baixo e a noite
+  var engLight = new THREE.PointLight(glowColor, 0.9, 46, 2);
+  engLight.position.set(0, -0.3, 3.4);
+  g.add(engLight);
+
   // escudo visivel
-  var shieldMesh = new THREE.Mesh(new THREE.SphereGeometry(5.4, 12, 9),
-    new THREE.MeshBasicMaterial({ color:0x7fe9ff, transparent:true, opacity:0.0, side:THREE.BackSide, depthWrite:false }));
+  var shieldMesh = new THREE.Mesh(new THREE.SphereGeometry(6.2, 14, 10),
+    new THREE.MeshBasicMaterial({ color:0x7fe9ff, transparent:true, opacity:0.0,
+      side:THREE.BackSide, depthWrite:false, blending:THREE.AdditiveBlending }));
   g.add(shieldMesh);
 
   // feixe de mineracao
   var beamGeo = new THREE.CylinderGeometry(0.25, 1.6, 1, 6, 1, true);
   beamGeo.translate(0,-0.5,0);
-  var beam = new THREE.Mesh(beamGeo, new THREE.MeshBasicMaterial({ color:0xffd24d, transparent:true, opacity:0.5, side:THREE.DoubleSide, depthWrite:false }));
+  var beam = new THREE.Mesh(beamGeo, new THREE.MeshBasicMaterial({ color:0xffd24d, transparent:true,
+    opacity:0.5, side:THREE.DoubleSide, depthWrite:false, blending:THREE.AdditiveBlending }));
   beam.visible = false; g.add(beam);
 
-  return { group:g, engines:engines, shieldMesh:shieldMesh, beam:beam };
+  return { group:g, engines:engines, shieldMesh:shieldMesh, beam:beam,
+           engLight:engLight, coreGlow:coreGlow, glowMat:glowM, glowColor:glowColor };
 }
 
 function createShip(){
@@ -1379,6 +1678,10 @@ function createShip(){
     engines: parts.engines,
     shieldMesh: parts.shieldMesh,
     beam: parts.beam,
+    engLight: parts.engLight,
+    coreGlow: parts.coreGlow,
+    glowMat: parts.glowMat,
+    glowColor: parts.glowColor,
     vel: new THREE.Vector3(0,0,0),
     speed: 0,
     throttle: 0.35,
@@ -1408,6 +1711,10 @@ function rebuildShip(){
   ship.engines = parts.engines;
   ship.shieldMesh = parts.shieldMesh;
   ship.beam = parts.beam;
+  ship.engLight = parts.engLight;
+  ship.coreGlow = parts.coreGlow;
+  ship.glowMat = parts.glowMat;
+  ship.glowColor = parts.glowColor;
   ship.group.position.copy(pos);
   ship.group.quaternion.copy(quat);
   scene.add(ship.group);
@@ -1515,13 +1822,19 @@ function updateShip(dt){
 
   // ---- efeitos visuais ----
   var sn = clamp(ship.speed/st.maxSpeed, 0, 1.6);
+  var flicker = Math.sin(performance.now()*0.021)*0.07;
   for(var i=0;i<ship.engines.length;i++){
-    var f = ship.engines[i];
-    var s = 0.35 + sn*(ship.boosting?2.6:1.3) + Math.sin(performance.now()*0.03+i)*0.08;
-    f.scale.set(0.8+sn*0.4, s, 0.8+sn*0.4);
-    f.material.opacity = 0.35 + sn*0.5;
-    f.material.color.setHSL(ship.boosting?0.85:0.52, 1, 0.6+sn*0.15);
+    var en = ship.engines[i];
+    var len = 0.25 + sn*(ship.boosting ? 2.6 : 1.15) + flicker;
+    en.plume.scale.set(0.8 + sn*0.35, Math.max(0.12,len), 0.8 + sn*0.35);
+    var hs = 2.2 + sn*2.4 + (ship.boosting ? 2.4 : 0) + flicker;
+    en.halo.scale.set(hs, hs, 1);
+    en.halo.material.opacity = 0.28 + sn*0.34;
   }
+  ship.glowMat.opacity = 0.55 + sn*0.38;
+  ship.coreGlow.material.opacity = 0.28 + sn*0.25 + (ship.boosting?0.18:0);
+  ship.engLight.intensity = 0.35 + sn*1.5 + (ship.boosting ? 1.1 : 0);
+  ship.engLight.distance = 40 + sn*30;
   ship.shieldMesh.material.opacity = damp(ship.shieldMesh.material.opacity, 0, 3, dt);
   world.currentBiome = dominantBiome(gx,gz);
 
@@ -1534,6 +1847,7 @@ function damageShip(amount){
   ship.shieldMesh.material.opacity = 0.35;
   shake = Math.max(shake, clamp(amount/22, 0.3, 1.4));
   SFX.hit();
+  padRumble(clamp(amount/45, 0.25, 1), 180);
   flashDamage();
   if(ship.shield <= 0){ crashShip(); }
 }
@@ -2002,6 +2316,7 @@ function paintRings(){
   if(!race.track) return;
   var rs = race.track.rings;
   for(var i=0;i<rs.length;i++){
+    rs[i].scale.set(1,1,1);
     if(race.state === "idle") rs[i].material = RING_MAT;
     else if(i === race.ringIdx) rs[i].material = RING_MAT_NEXT;
     else if(i < race.ringIdx) rs[i].material = RING_MAT_DONE;
@@ -2075,6 +2390,13 @@ function updateRace(dt){
     r.mesh.lookAt(p.x+tg.x*10, p.y+tg.y*10, p.z+tg.z*10);
   }
 
+  // anel alvo pulsa para chamar atencao
+  var nextRing = tr.rings[race.ringIdx % n];
+  if(nextRing){
+    var pl = 1 + Math.sin(performance.now()*0.006)*0.07;
+    nextRing.scale.set(pl, pl, 1);
+  }
+
   // checkpoint do jogador
   var target = tr.pts[race.ringIdx % n];
   var d = ship.group.position.distanceTo(target);
@@ -2082,6 +2404,7 @@ function updateRace(dt){
     race.ringIdx++;
     SFX.checkpoint();
     flashCheckpoint();
+    padRumble(0.35, 90);
     if(race.ringIdx % n === 0){
       var lapTime = race.t - race.lapStart;
       race.lapStart = race.t;
@@ -2332,7 +2655,7 @@ function updateHud(dt){
   $("hAlt").textContent = Math.round(alt);
   $("boostFill").style.width = (ship.boostE/st.boostMax*100).toFixed(1)+"%";
   $("shieldFill").style.width = (clamp(ship.shield/st.shieldMax,0,1)*100).toFixed(1)+"%";
-  $("speedLines").style.opacity = ship.boosting ? "0.75" : (ship.speed > st.maxSpeed*0.85 ? "0.35" : "0");
+  $("speedLines").style.opacity = ship.boosting ? "0.5" : (ship.speed > st.maxSpeed*0.85 ? "0.35" : "0");
 
   if(centerTimer > 0){
     centerTimer -= dt;
@@ -2659,10 +2982,32 @@ function openPause(){
     + '<tr><td>G</td><td>feixe de mineracao</td></tr>'
     + '<tr><td>X</td><td>interagir (base / largada)</td></tr>'
     + '<tr><td>C / P / Esc</td><td>catalogo / foto / pausa</td></tr></table>';
+  h += '<h3>Controle / gamepad ' + (pad.connected ? '<span style="color:#5cff9d">conectado</span>' : '<span class="small">nao detectado</span>') + '</h3>';
+  h += '<table class="t">'
+    + '<tr><td>Analogico esquerdo</td><td>guinada e arfagem</td></tr>'
+    + '<tr><td>Analogico direito (X)</td><td>rolagem</td></tr>'
+    + '<tr><td>RT / LT</td><td>acelerar / frear</td></tr>'
+    + '<tr><td>A / B</td><td>boost / drift</td></tr>'
+    + '<tr><td>X / Y</td><td>scanner / interagir</td></tr>'
+    + '<tr><td>LB / RB</td><td>rolagem esquerda e direita</td></tr>'
+    + '<tr><td>Direcional cima/baixo</td><td>subir / descer</td></tr>'
+    + '<tr><td>Direcional esquerda</td><td>feixe de mineracao</td></tr>'
+    + '<tr><td>Direcional direita</td><td>modo foto</td></tr>'
+    + '<tr><td>Start / Select</td><td>pausa / catalogo</td></tr></table>';
   h += '<p class="small">No tablet: joystick a esquerda, botoes a direita. Voo baixo recarrega o boost mais rapido.</p>';
+  h += '<h3>Ajustes</h3>';
+  h += '<span class="btn" id="btnFx">EFEITOS: ' + (save.fx === false ? "SIMPLES" : "COMPLETOS") + '</span>';
+  h += '<span class="btn" id="btnInv">ARFAGEM: ' + (save.invertPitch ? "INVERTIDA" : "NORMAL") + '</span>';
+  h += '<div style="margin-top:10px"></div>';
   h += '<span class="btn" id="btnResume">CONTINUAR</span>';
   h += '<span class="btn alt" id="btnReset">APAGAR PROGRESSO</span>';
   var p = makePanel(h);
+  p.querySelector("#btnFx").onclick = function(){
+    SFX.ui(); setFxEnabled(save.fx === false); closePanels(); openPause();
+  };
+  p.querySelector("#btnInv").onclick = function(){
+    SFX.ui(); save.invertPitch = !save.invertPitch; writeSave(); closePanels(); openPause();
+  };
   p.querySelector("#btnResume").onclick = function(){ SFX.ui(); closePanels(); };
   p.querySelector("#btnReset").onclick = function(){
     resetSave(); writeSave();
@@ -2735,6 +3080,7 @@ function initInput(){
   }, { passive:true });
 
   initTouchControls();
+  initGamepad();
   window.addEventListener("resize", onResize);
 }
 
@@ -2742,6 +3088,7 @@ function onResize(){
   camera.aspect = window.innerWidth/window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  if(postfx.ready) resizePostFX();
 }
 
 function initTouchControls(){
@@ -2798,8 +3145,143 @@ function initTouchControls(){
   bindBtn("tbMine",  function(){ input.mine = true; }, function(){ input.mine = false; });
 }
 
+/* ---------------------------------------------------------------------
+   GAMEPAD (API padrao do navegador)
+   Analogico esquerdo: guinada e arfagem | Analogico direito X: rolagem
+   RT acelerar | LT frear | A boost | B drift | X scanner | Y interagir
+   LB feixe | RB boost | direcional cima/baixo: subir/descer
+   Start: pausa | Select: catalogo | direcional direita: foto
+   --------------------------------------------------------------------- */
+var pad = {
+  index:null, connected:false, prev:[], deadzone:0.18, announced:false, lastRumble:0
+};
+
+function initGamepad(){
+  window.addEventListener("gamepadconnected", function(e){
+    pad.index = e.gamepad.index;
+    pad.connected = true;
+    if(!pad.announced){
+      pad.announced = true;
+      toast("Controle conectado: " + (e.gamepad.id||"gamepad").substring(0,28), "good");
+    }
+    if(touchMode){
+      touchMode = false;
+      input.touch = false;
+      $("touch").style.display = "none";
+      document.body.classList.remove("touchOn");
+    }
+  });
+  window.addEventListener("gamepaddisconnected", function(e){
+    if(pad.index === e.gamepad.index){
+      pad.connected = false; pad.index = null;
+      toast("Controle desconectado", "bad");
+    }
+  });
+}
+
+function getPad(){
+  if(!navigator.getGamepads) return null;
+  var list = navigator.getGamepads();
+  if(!list) return null;
+  if(pad.index !== null && list[pad.index]) return list[pad.index];
+  for(var i=0;i<list.length;i++){
+    if(list[i] && list[i].connected){ pad.index = i; pad.connected = true; return list[i]; }
+  }
+  return null;
+}
+
+function padAxis(gp, i){
+  var v = gp.axes.length > i ? gp.axes[i] : 0;
+  if(Math.abs(v) < pad.deadzone) return 0;
+  var sign = v < 0 ? -1 : 1;
+  var mag = (Math.abs(v) - pad.deadzone) / (1 - pad.deadzone);
+  return sign * mag * mag;    // curva suave para mira fina
+}
+function padDown(gp, i){
+  var b = gp.buttons[i];
+  if(!b) return false;
+  return typeof b === "object" ? (b.pressed || b.value > 0.5) : b > 0.5;
+}
+function padValue(gp, i){
+  var b = gp.buttons[i];
+  if(!b) return 0;
+  return typeof b === "object" ? b.value : b;
+}
+function padPressed(gp, i){
+  var now = padDown(gp, i);
+  var was = !!pad.prev[i];
+  return now && !was;
+}
+function padRumble(strength, ms){
+  var gp = getPad();
+  if(!gp || !gp.vibrationActuator || !gp.vibrationActuator.playEffect) return;
+  var t = performance.now();
+  if(t - pad.lastRumble < 120) return;
+  pad.lastRumble = t;
+  try{
+    gp.vibrationActuator.playEffect("dual-rumble", {
+      startDelay:0, duration:ms||160, weakMagnitude:strength*0.7, strongMagnitude:strength
+    });
+  }catch(e){}
+}
+
+function updateGamepad(dt){
+  var gp = getPad();
+  if(!gp){ pad.connected = false; return false; }
+  pad.connected = true;
+
+  // botoes que valem mesmo com painel aberto
+  if(padPressed(gp, 9)){ SFX.ui(); if(openPanel) closePanels(); else openPause(); }
+  if(padPressed(gp, 8)){ SFX.ui(); if(openPanel) closePanels(); else openCatalog(); }
+  if(openPanel && padPressed(gp, 1)){ SFX.ui(); closePanels(); }
+
+  var handled = true;
+  if(!paused && !photo.active){
+    var lx = padAxis(gp, 0), ly = padAxis(gp, 1);
+    var rx = padAxis(gp, 2);
+    input.yaw   = clamp(lx, -1, 1);
+    input.pitch = clamp(save.invertPitch ? ly : -ly, -1, 1);
+    input.roll  = clamp(rx, -1, 1);
+    if(padDown(gp, 4)) input.roll = clamp(input.roll - 1, -1, 1);
+    if(padDown(gp, 5) && !padDown(gp,0)) input.roll = clamp(input.roll + 1, -1, 1);
+
+    var rt = Math.max(padValue(gp, 7), padDown(gp,7)?1:0);
+    var lt = Math.max(padValue(gp, 6), padDown(gp,6)?1:0);
+    if(rt > 0.05) input.throttle = clamp(input.throttle + dt*1.1*rt, 0, 1);
+    if(lt > 0.05) input.throttle = clamp(input.throttle - dt*1.5*lt, 0, 1);
+
+    var l = 0;
+    if(padDown(gp, 12)) l += 1;
+    if(padDown(gp, 13)) l -= 1;
+    input.lift = damp(input.lift, l, 10, dt);
+
+    input.boost = padDown(gp, 0);
+    input.drift = padDown(gp, 1);
+    input.mine  = padDown(gp, 14) || padDown(gp, 10);   // direcional esquerda ou L3
+
+    if(padPressed(gp, 2)) doScan();
+    if(padPressed(gp, 3) && promptAction){
+      var act = promptAction; promptAction = null; act();
+    }
+    if(padPressed(gp, 15)) togglePhoto();
+  } else {
+    handled = false;
+  }
+
+  for(var i=0;i<gp.buttons.length;i++) pad.prev[i] = padDown(gp, i);
+  return handled;
+}
+
 function updateInput(dt){
-  if(paused){ input.boost = false; return; }
+  if(paused){
+    input.boost = false;
+    updateGamepad(dt);
+    return;
+  }
+  if(updateGamepad(dt)){
+    ship.drifting = input.drift;
+    return;
+  }
   if(!touchMode){
     var p = 0, y = 0, r = 0, l = 0;
     if(keys["arrowup"]) p += 1;
@@ -2880,7 +3362,7 @@ function capturePhoto(){
   var f = $("flash"); f.style.opacity = "0.9";
   setTimeout(function(){ f.style.opacity = "0"; }, 120);
   try{
-    renderer.render(scene, camera);
+    renderFrame(0.016);
     var url = renderer.domElement.toDataURL("image/png");
     var a = document.createElement("a");
     a.href = url;
@@ -3029,7 +3511,7 @@ function animate(now){
   saveTimer -= dt;
   if(saveTimer <= 0){ saveTimer = 12; writeSave(); }
 
-  renderer.render(scene, camera);
+  renderFrame(dt);
 }
 
 var faunaTimer = 0;
