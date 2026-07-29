@@ -71,6 +71,8 @@ const SUN_DISC_FRAC = 0.2;
 const SUN_ANGULAR_BOOST = 2.1;
 /** Duração padrão de um dia, em segundos. */
 const DEFAULT_DAY_LENGTH = 1200;
+/** Airglow + luz estelar: piso de ambiente para a noite não ser preto absoluto. */
+const NIGHT_GLOW = [0.0022, 0.0030, 0.0052];
 
 // ── Estado do módulo (temporários reutilizados: zero alocação por frame) ─────
 
@@ -688,10 +690,13 @@ function updateRadiometry(ctx) {
   // Zênite: visada para cima, então nu = muS.
   cpuSkyRadiance(p, rNorm, 1, muS, muS, _radiance);
   const e1 = S.sunIrradiance;
+  // O piso noturno representa airglow + luz das estrelas: sem ele a noite
+  // entrega ambiente exatamente zero e o terreno vira uma silhueta chapada.
+  const glow = p.density * (S.hasPlanet ? 1 : 0);
   S.ambientTop.setRGB(
-    clamp(_radiance[0] * e1.x, 0, 12),
-    clamp(_radiance[1] * e1.y, 0, 12),
-    clamp(_radiance[2] * e1.z, 0, 12),
+    clamp(_radiance[0] * e1.x + NIGHT_GLOW[0] * glow, 0, 12),
+    clamp(_radiance[1] * e1.y + NIGHT_GLOW[1] * glow, 0, 12),
+    clamp(_radiance[2] * e1.z + NIGHT_GLOW[2] * glow, 0, 12),
   );
 
   // Horizonte: média entre o lado do sol e o oposto. O cosseno é limitado a
@@ -764,9 +769,11 @@ function writeFogUniforms(ctx) {
   // é a metade "terreno" da transição contínua espaço↔superfície.
   const base = S.body?.biome?.sky?.fogDensity ?? 0.00005;
   const h = Number.isFinite(S.radiusAlt) ? Math.max(0, S.radiusAlt) : Infinity;
-  S.fogDensity = S.hasPlanet && Number.isFinite(h)
+  let d = S.hasPlanet && Number.isFinite(h)
     ? base * Math.exp(-h / Math.max(1, S.params.hR))
     : 0;
+  if (d < 1e-12) d = 0;          // evita denormal chegando ao shader
+  S.fogDensity = d;
 
   setUniformColor(fu.uFogColor, S.fogColor);
   setUniformNumber(fu.uFogDensity, S.fogDensity);

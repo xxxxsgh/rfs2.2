@@ -168,15 +168,31 @@ function chunkSeed(body) {
 function onWorkerMessage(slot, m) {
   if (!m) return;
   if (m.type === 'chunk' || m.type === 'fail') {
-    slot.job = null;
-    S.workersBusy = Math.max(0, S.workersBusy - 1);
+    // Só libera o slot com a resposta DO SEU job: depois de uma troca de
+    // planeta ainda chegam respostas antigas, e liberar por elas faria o
+    // gerente despachar em cima de um worker que ainda está ocupado.
+    if (slot.job && slot.job.seq === m.seq) {
+      slot.job = null;
+      S.workersBusy = Math.max(0, S.workersBusy - 1);
+    }
   }
   if (m.type === 'chunk') integrate(m);
 }
 
 // ── Ciclo de vida do corpo ativo ────────────────────────────────────────────
 
+/**
+ * Troca o corpo streamado. Chamado de fora (arnês de capturas, `flight`,
+ * `universe`), o corpo passa a ser "manual" e o auto-seleção deixa de brigar
+ * por ele — sem isso, `shots.js` escolheria um planeta e o módulo o trocaria
+ * nos frames seguintes, porque o jogador ainda não foi teletransportado.
+ */
 export function setActive(body) {
+  S.manual = !!body;
+  activate(body);
+}
+
+function activate(body) {
   if (S.body === body) return;
   clearActive();
   S.body = body || null;
@@ -318,10 +334,13 @@ function autoSelect(ctx) {
   if (!bodies || bodies.length === 0) return;
   const p = ctx.player.position;
 
+  // Um corpo escolhido manualmente só é largado muito longe: é o que garante
+  // que uma captura possa fixar o planeta antes de teleportar o jogador.
   if (S.body) {
-    const d = distTo(p, S.body.center);
-    if (d < S.body.radius * 12) return;    // continua sendo o corpo relevante
+    const keep = S.body.radius * (S.manual ? 40 : 12);
+    if (distTo(p, S.body.center) - S.body.radius < keep) return;
   }
+
   let best = null, bestScore = Infinity;
   for (let i = 0; i < bodies.length; i++) {
     const b = bodies[i];
@@ -329,7 +348,7 @@ function autoSelect(ctx) {
     const d = distTo(p, b.center) - b.radius;
     if (d < b.radius * 6 && d < bestScore) { bestScore = d; best = b; }
   }
-  if (best !== S.body) setActive(best);
+  if (best !== S.body) { S.manual = false; activate(best); }
 }
 
 function distTo(a, b) {

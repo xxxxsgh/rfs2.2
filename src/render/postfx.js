@@ -115,8 +115,9 @@ function defaultParams() {
     grade: { saturation: 1.06, contrast: 1.0 },
     aa: { enabled: true, mode: 'fxaa', subpixel: 0.75, edgeThreshold: 0.125, edgeThresholdMin: 0.0312 },
 
-    /** Liga as queries de tempo de GPU (custa; só com o overlay de debug). */
-    profile: false,
+    /** Custo por passe. Só age com o overlay de debug aberto (ctx.debug.enabled),
+     *  porque queries de tempo sincronizam o driver em alguns fabricantes. */
+    profile: true,
   };
 }
 
@@ -668,7 +669,7 @@ function _publishDebug(ctx) {
     let line = '';
     let total = 0;
     S.profiler.ms.forEach((v, k) => { line += `${k} ${v.toFixed(2)} `; total += v; });
-    ctx.debug.set('postfx.gpu', `${line}| total ${total.toFixed(2)}ms`);
+    ctx.debug.set(`postfx.${S.profiler.mode}`, `${line}| total ${total.toFixed(2)}ms`);
   }
 }
 
