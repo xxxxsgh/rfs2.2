@@ -196,7 +196,12 @@ export function createField(seed, terrainParams, opts = {}) {
     // Só existem acima do mar e desaparecem suavemente quando a célula do LOD
     // é grande demais para representá-los (fade, nunca corte seco → sem pop).
     if (T.arches > 0.001) {
-      const lodFade = 1 - smoothstep(22, 95, c);
+      // Banda de fade LARGA de propósito. O LOD dobra `c` de um nível para o
+      // outro; com uma banda estreita a diferença de altura entre dois chunks
+      // vizinhos de níveis diferentes chegaria a metros e apareceria como um
+      // degrau na silhueta. Espalhando o fade por uma década, o degrau em
+      // qualquer junta fica abaixo do meio metro.
+      const lodFade = 1 - smoothstep(25, 260, c);
       if (lodFade > 0.001) {
         const above = saturate(h / (AMP * 0.08 + 30));
         const gate = T.arches * land * above * lodFade;

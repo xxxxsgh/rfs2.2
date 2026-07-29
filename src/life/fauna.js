@@ -275,7 +275,7 @@ function createInstance(ctx, sp) {
     active: false, retiring: false, cooldown: 0,
     bodyBob: 0, bodyRoll: 0, bodyPitch: 0, lastSpeed: 0,
     voiceT: 2 + spawnRng.float() * 6,
-    climb: 0, turnSignal: 0, deathRoll: 0, grazing: false,
+    climb: 0, turnSignal: 0, deathRoll: 0, grazing: false, feetStale: true,
     cruise: lerp(22, 95, spawnRng.float()),
   };
   mesh.userData.creature = c;
@@ -809,7 +809,12 @@ export function lateUpdate(dt, ctx) {
     placeOne(c);
     applyLod(c);
     if (c.lod === 0 && body) poseCreature(c, dt, ctx, body);
-    else if (c.lod === 1) poseCoarse(c, dt);
+    else {
+      // Fora do LOD0 ninguém posa os pés — ao voltar, eles precisam ser
+      // reancorados ou a IK persegue um apoio de 100 m atrás.
+      c.feetStale = true;
+      if (c.lod === 1) poseCoarse(c, dt);
+    }
   }
 }
 
@@ -879,7 +884,10 @@ function poseCreature(c, dt, ctx, body) {
   if (tr.flying) c.wingPhase = (c.wingPhase + dt * lerp(3.2, 1.1, saturate(tr.sizeM / 6)) * (c.climb > 0 ? 1.35 : 0.55)) % 1;
 
   // 2. Pés: alterna apoio/balanço e planta pontos reais do terreno.
-  if (!tr.flying) updateFeet(c, dt, ctx, body, s, stride);
+  if (!tr.flying) {
+    if (c.feetStale) resetFeet(ctx, body, c);
+    updateFeet(c, dt, ctx, body, s, stride);
+  }
 
   // 3. Corpo responde aos pés (antes da IK, para que a IK compense).
   poseRoot(c, dt, s, rest, rig);
@@ -899,6 +907,21 @@ function poseCreature(c, dt, ctx, body) {
 
   // 6. Cabeça por último: olha o alvo sem quebrar o pescoço.
   poseHead(c, dt, ctx, rest, rig, tr);
+}
+
+/**
+ * Escolhe o próximo ponto de apoio: offset lateral/longitudinal de repouso da
+ * perna, mais `ahead` metros à frente, projetado no terreno real.
+ * `_right` já precisa estar calculado pelo chamador.
+ */
+function replant(c, ctx, body, L, st, s, ahead) {
+  st.toWorld.set(
+    c.pos.x + _right.x * L.restFoot.x * s + c.fwd.x * (L.restFoot.z * s + ahead),
+    c.pos.y + _right.y * L.restFoot.x * s + c.fwd.y * (L.restFoot.z * s + ahead),
+    c.pos.z + _right.z * L.restFoot.x * s + c.fwd.z * (L.restFoot.z * s + ahead),
+  );
+  snapToGround(ctx, body, st.toWorld);
+  st.toWorld.addScaled(c.up, L.restFoot.y * s);
 }
 
 function updateFeet(c, dt, ctx, body, s, stride) {

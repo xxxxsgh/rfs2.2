@@ -367,6 +367,65 @@ bool aetherSky(vec3 roR, vec3 rd, out vec3 inscatter, out vec3 transmittance) {
   return true;
 }
 
+// ── LUT de céu do frame (Hillaire "sky-view") ───────────────────────────────
+//
+// Marchar a atmosfera POR PIXEL custa, a 1600x900 com 24 passos, 35 milhões de
+// amostras por frame — inviável em software (o arnês de captura roda
+// SwiftShader) e caro até em GPU. Como a atmosfera é esfericamente simétrica,
+// o in-scattering visto de um ponto só depende de DUAS variáveis: o ângulo
+// zenital da visada e o azimute em relação ao sol. Cabe numa textura de
+// 192x108 recomputada uma vez por frame: 2000x menos trabalho, e o passe de
+// tela cheia vira uma única leitura.
+//
+// A parametrização vertical concentra resolução exatamente onde a função tem
+// gradiente alto — o horizonte quando se está dentro, o limbo quando se está
+// fora. É por isso que o anel de atmosfera visto da órbita continua nítido.
+
+/** v da LUT → ângulo zenital da visada. */
+float aetherSkyViewTheta(float v) {
+  float th = uSkyGeom.y;
+  float ta = uSkyGeom.z;
+  if (ta < 0.0) {
+    if (v < 0.5) { float c = 1.0 - 2.0 * v; return th * (1.0 - c * c); }
+    float c = 2.0 * v - 1.0; return th + (AETHER_PI - th) * c * c;
+  }
+  if (v < 0.5) return ta * (2.0 * v);
+  float c = 2.0 * v - 1.0;
+  return ta + (AETHER_PI - ta) * c * c;
+}
+
+/** Inversa: ângulo zenital → v da LUT. */
+float aetherSkyViewV(float theta) {
+  float th = uSkyGeom.y;
+  float ta = uSkyGeom.z;
+  if (ta < 0.0) {
+    if (theta < th) { float c = sqrt(max(0.0, 1.0 - theta / max(th, 1e-5))); return 0.5 * (1.0 - c); }
+    float c = sqrt(max(0.0, (theta - th) / max(AETHER_PI - th, 1e-5)));
+    return 0.5 * (1.0 + c);
+  }
+  if (theta < ta) return 0.5 * theta / max(ta, 1e-5);
+  float c = sqrt(max(0.0, (theta - ta) / max(AETHER_PI - ta, 1e-5)));
+  return 0.5 * (1.0 + c);
+}
+
+/** Reconstrói a direção de visada a partir das coordenadas da LUT. */
+vec3 aetherSkyViewDir(vec2 uv) {
+  float theta = aetherSkyViewTheta(uv.y);
+  float phi = uv.x * AETHER_PI;
+  float st = sin(theta);
+  return normalize(uSkyUp * cos(theta) + (uSkySunRef * cos(phi) + uSkySide * sin(phi)) * st);
+}
+
+/** Amostra o in-scattering do frame para uma direção de mundo. */
+vec3 aetherSkyView(vec3 rd) {
+  float ct = clamp(dot(rd, uSkyUp), -1.0, 1.0);
+  vec3 h = rd - uSkyUp * ct;
+  float hl = length(h);
+  float phi = hl > 1e-6 ? acos(clamp(dot(h / hl, uSkySunRef), -1.0, 1.0)) : 0.0;
+  float v = aetherSkyViewV(acos(ct));
+  return texture2D(uSkyView, vec2(clamp(phi / AETHER_PI, 0.0, 1.0), clamp(v, 0.0, 1.0))).rgb;
+}
+
 /**
  * Perspectiva aérea para geometria opaca: quanto de céu se acumula entre a
  * câmera e um ponto a "distMeters", e quanto da cor original sobrevive.
@@ -402,6 +461,11 @@ export function createAtmoUniforms() {
   return {
     uAtmoTrans: { value: null },
     uAtmoMulti: { value: null },
+    uSkyView: { value: null },
+    uSkyGeom: { value: new THREE.Vector4(1.0001, 1.5708, -1, 0) },
+    uSkyUp: { value: new THREE.Vector3(0, 1, 0) },
+    uSkySunRef: { value: new THREE.Vector3(1, 0, 0) },
+    uSkySide: { value: new THREE.Vector3(0, 0, 1) },
     uAtmoGeom: { value: new THREE.Vector4(1, 1.06, 1200, 180) },
     uAtmoRadius: { value: 150000 },
     uAtmoBetaR: { value: new THREE.Vector3(1, 1, 1) },
@@ -550,12 +614,26 @@ void main() {
 }
 `;
 
+const SKYVIEW_FRAG = /* glsl */`
+precision highp float;
+varying vec2 vUv;
+${SCATTERING_CHUNK}
+void main() {
+  vec3 rd = aetherSkyViewDir(vUv);
+  vec3 ro = uSkyUp * uSkyGeom.x;
+  vec3 inscat, T;
+  if (!aetherSky(ro, rd, inscat, T)) inscat = vec3(0.0);
+  gl_FragColor = vec4(max(inscat, vec3(0.0)), 1.0);
+}
+`;
+
 /**
- * Gerenciador das duas LUTs. Só recalcula quando `params.key` muda — trocar de
- * planeta custa dois draws minúsculos, e ficar no mesmo planeta custa zero.
+ * Gerenciador das LUTs. Transmitância e multi-espalhamento só recalculam quando
+ * `params.key` muda (troca de planeta). A LUT de céu é refeita todo frame — é
+ * ela que carrega a posição do sol e a altitude da câmera.
  */
 export class ScatteringLUTs {
-  constructor(renderer) {
+  constructor(renderer, skyViewSize = [192, 108]) {
     this.renderer = renderer;
     this.key = null;
     this.lastCostMs = 0;
@@ -563,6 +641,7 @@ export class ScatteringLUTs {
     const type = this._pickType();
     this.transTarget = this._makeTarget(256, 64, type);
     this.multiTarget = this._makeTarget(32, 32, type);
+    this.skyViewTarget = this._makeTarget(skyViewSize[0], skyViewSize[1], type);
 
     this._scene = new THREE.Scene();
     this._camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -614,6 +693,38 @@ export class ScatteringLUTs {
 
   get transmittance() { return this.transTarget.texture; }
   get multiScatter() { return this.multiTarget.texture; }
+  get skyView() { return this.skyViewTarget.texture; }
+
+  /**
+   * Material que preenche a LUT de céu. Compartilha os MESMOS objetos de
+   * uniform do céu (cópia rasa), então tudo que o módulo escreve por frame
+   * chega aqui sem sincronização manual. `uSkyView` é anulado para não existir
+   * chance de laço de realimentação com o próprio alvo.
+   */
+  makeSkyViewMaterial(shared, defines) {
+    const u = Object.assign({}, shared);
+    u.uSkyView = { value: null };
+    return new THREE.ShaderMaterial({
+      uniforms: u,
+      vertexShader: LUT_VERT,
+      fragmentShader: SKYVIEW_FRAG,
+      defines: defines || {},
+      depthTest: false, depthWrite: false,
+    });
+  }
+
+  /** Redesenha a LUT de céu (uma vez por frame, antes do render principal). */
+  renderSkyView(material) {
+    const r = this.renderer;
+    const prev = r.getRenderTarget();
+    const prevAuto = r.autoClear;
+    r.autoClear = false;
+    this._quad.material = material;
+    r.setRenderTarget(this.skyViewTarget);
+    r.render(this._scene, this._camera);
+    r.setRenderTarget(prev);
+    r.autoClear = prevAuto;
+  }
 
   /**
    * Recomputa as LUTs se necessário.
@@ -654,6 +765,7 @@ export class ScatteringLUTs {
   dispose() {
     this.transTarget.dispose();
     this.multiTarget.dispose();
+    this.skyViewTarget.dispose();
     this.transMat.dispose();
     this.multiMat.dispose();
     this._geom.dispose();

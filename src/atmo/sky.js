@@ -188,9 +188,11 @@ void main() {
   }
   gl_FragColor = vec4(Tv, 1.0);
 #else
-  vec3 inscat, Tv;
-  if (!aetherSky(roR, rd, inscat, Tv)) discard;
-  gl_FragColor = vec4(max(inscat, vec3(0.0)) * uSkyExposure, 1.0);
+  // Uma leitura na LUT de céu do frame. O raymarch já foi pago, uma vez só,
+  // em 192x108 — aqui só resta reprojetar a direção.
+  vec3 hit2 = aetherSphere(roR, rd, uAtmoGeom.y);
+  if (hit2.z < 0.0 || hit2.y <= 0.0) discard;
+  gl_FragColor = vec4(max(aetherSkyView(rd), vec3(0.0)) * uSkyExposure, 1.0);
 #endif
 
   #include <logdepthbuf_fragment>
@@ -247,19 +249,21 @@ export async function init(ctx) {
   S.ctx = ctx;
   registerScatteringChunk();
 
+  const preset = ctx.quality?.preset || 'high';
+  // A LUT de céu é o único lugar onde o raymarch acontece, então dá para ser
+  // generoso nos passos: são ~20 mil pixels, não 1,4 milhão.
+  const steps = preset === 'low' ? 14 : preset === 'medium' ? 20 : preset === 'ultra' ? 40 : 30;
+  const lutSize = preset === 'low' ? [128, 72] : preset === 'ultra' ? [256, 144] : [192, 108];
+
   const renderer = ctx.engine.renderer;
-  S.luts = new ScatteringLUTs(renderer);
+  S.luts = new ScatteringLUTs(renderer, lutSize);
   S.uniforms = createAtmoUniforms();
   S.uniforms.uAtmoTrans.value = S.luts.transmittance;
   S.uniforms.uAtmoMulti.value = S.luts.multiScatter;
+  S.uniforms.uSkyView.value = S.luts.skyView;
   S.uniforms.uPlanetCenter = { value: new THREE.Vector3() };
   S.uniforms.uSkyExposure = { value: 1.0 };
-
-  // Passos do raymarch conforme o preset — o céu é fullscreen, é o que mais
-  // custa; em `low` 10 passos ainda dão gradiente sem banding graças à
-  // integração analítica por segmento.
-  const preset = ctx.quality?.preset || 'high';
-  const steps = preset === 'low' ? 10 : preset === 'medium' ? 16 : preset === 'ultra' ? 32 : 24;
+  S.skyViewMat = S.luts.makeSkyViewMaterial(S.uniforms, { AETHER_SKY_STEPS: steps });
 
   S.shellGeom = new THREE.SphereGeometry(1, 64, 32);
 
@@ -286,7 +290,6 @@ export async function init(ctx) {
     uniforms: S.uniforms,
     vertexShader: SHELL_VERT,
     fragmentShader: SHELL_FRAG,
-    defines: { AETHER_SKY_STEPS: steps },
     side: THREE.BackSide,
     transparent: true,
     depthWrite: false,
@@ -421,6 +424,11 @@ export function lateUpdate(dt, ctx) {
   S.uniforms.uAtmoSunIrr.value.copy(S.sunIrradiance);
   S.uniforms.uAtmoSunDir2.value.copy(S.sunDirection2);
   S.uniforms.uAtmoSunIrr2.value.copy(S.sunIrradiance2);
+
+  // A LUT de céu depende da POSIÇÃO DA CÂMERA (não do jogador): é dela que o
+  // shader da casca reconstrói o raio. Qualquer divergência apareceria como um
+  // horizonte deslocado.
+  if (S.body) updateSkyView(ctx);
 
   // Discos solares: o farScene tem a câmera na origem, então basta projetar a
   // direção numa distância fixa dentro do frustum.

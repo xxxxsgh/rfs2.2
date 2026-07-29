@@ -70,7 +70,7 @@ const RINGS = [
   // Tapete de detalhe: cobertura rasteira densíssima, some no fim do LOD0 (60 m).
   { name: 'carpet', cell: 32, radius: 66, spacing: 1.0, maxSlots: 32, scope: 'carpet', lods: [0], imposter: false, densityMul: 3.0, scaleMul: 0.70 },
   // Cobertura média: arbusto, samambaia, flor, tufo grande. Vai até o fim do LOD1.
-  { name: 'ground', cell: 96, radius: 258, spacing: 4.0, maxSlots: 24, scope: 'small', lods: [0, 1], imposter: false, densityMul: 1.1, scaleMul: 1.0 },
+  { name: 'ground', cell: 96, radius: 258, spacing: 3.7, maxSlots: 26, scope: 'small', lods: [0, 1], imposter: false, densityMul: 1.1, scaleMul: 1.0 },
   // Copa: tudo que tem silhueta a distância, até o fim do imposter.
   { name: 'canopy', cell: 384, radius: 1290, spacing: 13.5, maxSlots: 28, scope: 'tall', lods: [0, 1, 2], imposter: true, densityMul: 1.0, scaleMul: 1.0 },
 ];
@@ -1014,13 +1014,17 @@ function populateStep(ctx, cell) {
 
     // ── Campo de aglomeração ────────────────────────────────────────────────
     const nx = _v1.x, ny = _v1.y, nz = _v1.z;
+    // Curvas calibradas para uma distribuição BIMODAL: ~33% do terreno vira
+    // clareira quase limpa e ~15% vira bosque cheio. Um campo de contraste
+    // baixo devolve densidade média em todo lugar — que é a definição visual de
+    // "vegetação uniforme".
     const forest = S.noise.fbm(nx * cf, ny * cf, nz * cf, 4, 2.1, 0.55);
     const clearing = S.noiseAux.noise3(nx * cg + 11.3, ny * cg - 4.7, nz * cg + 2.9);
-    let cluster = smoothstep(-0.30, 0.48, forest) * (1 - smoothstep(0.28, 0.72, clearing));
+    let cluster = smoothstep(-0.25, 0.22, forest) * (1 - smoothstep(0.32, 0.78, clearing));
     cluster = saturate(cluster);
     if (cluster <= 0.002) continue;
 
-    const p = density * (0.10 + 0.90 * cluster * cluster);
+    const p = density * (0.06 + 0.94 * Math.pow(cluster, 1.4));
     if (hf() > p) continue;
 
     // ── Terreno ─────────────────────────────────────────────────────────────
