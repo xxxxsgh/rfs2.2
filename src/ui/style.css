@@ -1,0 +1,80 @@
+/* AETHER — estilos base.
+   O módulo ui/hud.js pode ADICIONAR regras em src/ui/hud.css.
+   Este arquivo cobre reset, tela de boot e o contêiner do HUD. */
+
+:root {
+  --ink: #dff0ff;
+  --dim: #7f9dbb;
+  --accent: #ffb347;
+  --accent2: #5fe0ff;
+  --bg: #03040a;
+  --panel: rgba(6, 12, 24, 0.62);
+  --line: rgba(120, 200, 255, 0.22);
+  --safeT: env(safe-area-inset-top, 0px);
+  --safeB: env(safe-area-inset-bottom, 0px);
+  --safeL: env(safe-area-inset-left, 0px);
+  --safeR: env(safe-area-inset-right, 0px);
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+html, body {
+  margin: 0; padding: 0; height: 100%; overflow: hidden;
+  background: var(--bg); color: var(--ink);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, Helvetica, Arial, sans-serif;
+  -webkit-user-select: none; user-select: none;
+  touch-action: none; overscroll-behavior: none;
+}
+
+canvas { display: block; }
+#app { position: fixed; inset: 0; }
+#glwrap { position: absolute; inset: 0; }
+
+.hud {
+  position: absolute; inset: 0; z-index: 50; pointer-events: none;
+  padding: calc(14px + var(--safeT)) calc(14px + var(--safeR)) calc(14px + var(--safeB)) calc(14px + var(--safeL));
+}
+.hud .clickable { pointer-events: auto; }
+
+/* ── boot ─────────────────────────────────────────────────────────────────── */
+#boot {
+  position: fixed; inset: 0; z-index: 200;
+  background: radial-gradient(ellipse at 50% 45%, #10182e 0%, #03040a 70%);
+  display: flex; align-items: center; justify-content: center;
+  transition: opacity 0.9s ease, visibility 0.9s;
+}
+#boot.gone { opacity: 0; visibility: hidden; pointer-events: none; }
+
+.boot-inner { text-align: center; padding: 24px; max-width: 560px; }
+
+#boot h1 {
+  margin: 0 0 6px; font-size: clamp(40px, 10vw, 92px); font-weight: 200;
+  letter-spacing: 0.42em; text-indent: 0.42em;
+  color: #fff; text-shadow: 0 0 30px rgba(95, 224, 255, 0.55), 0 0 90px rgba(255, 140, 60, 0.3);
+}
+.boot-sub {
+  margin: 0 0 34px; font-size: 12px; letter-spacing: 0.34em; text-transform: uppercase;
+  color: var(--dim);
+}
+#bootBar {
+  width: min(400px, 74vw); height: 2px; margin: 0 auto 14px;
+  background: rgba(120, 200, 255, 0.16); overflow: hidden;
+}
+#bootFill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, var(--accent2), var(--accent));
+  transition: width 0.25s ease;
+  box-shadow: 0 0 14px rgba(95, 224, 255, 0.8);
+}
+#bootTxt { margin: 0; font-size: 11px; letter-spacing: 0.18em; color: var(--dim); min-height: 16px; }
+.boot-seed { margin: 18px 0 0; font-size: 10px; letter-spacing: 0.24em; color: rgba(127, 157, 187, 0.55); text-transform: uppercase; }
+
+#bootBtn {
+  margin-top: 26px; padding: 14px 44px;
+  border: 1px solid rgba(255, 179, 71, 0.5); border-radius: 2px;
+  background: rgba(255, 179, 71, 0.07); color: #fff;
+  font: inherit; font-size: 13px; letter-spacing: 0.36em; text-indent: 0.36em;
+  cursor: pointer; transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
+}
+#bootBtn:hover { background: rgba(255, 179, 71, 0.18); border-color: var(--accent); box-shadow: 0 0 30px rgba(255, 179, 71, 0.25); }
+#bootBtn:active { transform: translateY(1px); }
