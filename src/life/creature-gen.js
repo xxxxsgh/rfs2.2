@@ -237,7 +237,30 @@ function poleFrom(hip, knee, ankle) {
   return { x: px / pl, y: py / pl, z: pz / pl };
 }
 
+function dist3(a, b) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
+
+/**
+ * Garante FLEXÃO de repouso no membro.
+ *
+ * Se, parado, a perna já está praticamente reta (soma dos segmentos ≈ distância
+ * quadril→tornozelo), a IK não tem para onde esticar: qualquer passada à frente
+ * cai fora do alcance e o membro vira um arame. Empurramos o joelho ao longo do
+ * próprio vetor-polo até sobrar ~14% de folga — é a mesma razão pela qual
+ * nenhum animal fica com a perna travada em pé.
+ */
+function ensureFlex(def, minRatio = 1.14) {
+  const rest = dist3(def.hip, def.ankle) || 1e-4;
+  const pole = poleFrom(def.hip, def.knee, def.ankle);
+  for (let i = 0; i < 24; i++) {
+    if (dist3(def.hip, def.knee) + dist3(def.knee, def.ankle) >= rest * minRatio) break;
+    def.knee.x += pole.x * rest * 0.035;
+    def.knee.y += pole.y * rest * 0.035;
+    def.knee.z += pole.z * rest * 0.035;
+  }
+}
+
 function addLeg(joints, J, rig, parentIdx, def) {
+  ensureFlex(def);
   const hip = J(def.name + '_hip', parentIdx, def.hip.x, def.hip.y, def.hip.z);
   const knee = J(def.name + '_knee', hip, def.knee.x, def.knee.y, def.knee.z);
   const ankle = J(def.name + '_ankle', knee, def.ankle.x, def.ankle.y, def.ankle.z);
@@ -1196,7 +1219,20 @@ export function* speciesSteps(rng, biome, opts = {}) {
   const { joints, rig } = buildPlan(arch, p);
   traits.gaitType = rig.gait;
   traits.legCount = rig.legs.length;
-  traits.strideLen = Math.max(0.15, p.legLen * lerp(0.9, 1.5, p.digitigrade || 0.5));
+  // A passada NÃO é um número solto: ela é limitada pela geometria da perna.
+  // Se meia passada mais a altura do quadril passar do alcance do membro, a IK
+  // nunca chega no pé e a perna vira um arame esticado. Aqui o passo máximo sai
+  // de Pitágoras sobre o próprio esqueleto.
+  if (rig.legs.length) {
+    const L0 = rig.legs[0];
+    const reach = L0.upperLen + L0.lowerLen;
+    const hipH = Math.max(0.01, L0.hipLocal.y - L0.restFoot.y);
+    const lat = Math.abs(L0.hipLocal.x - L0.restFoot.x);
+    const maxHalf = Math.sqrt(Math.max(1e-4, reach * reach * 0.90 - hipH * hipH - lat * lat));
+    traits.strideLen = clamp(p.legLen * lerp(0.9, 1.5, p.digitigrade || 0.5), 0.1, maxHalf * 1.8);
+  } else {
+    traits.strideLen = Math.max(0.15, p.bodyLen * 0.35);
+  }
   traits.dutyFactor = rig.gait === 'gallop' ? 0.42 : rig.gait === 'tripod' ? 0.62 : 0.58;
   if (traits.flying) traits.gaitType = arch === 'floater' ? 'hover' : 'flap';
   yield 'plan';

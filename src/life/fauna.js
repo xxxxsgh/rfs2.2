@@ -943,7 +943,8 @@ function updateFeet(c, dt, ctx, body, s, stride) {
       c.pos.y + _right.y * L.restFoot.x * s + c.fwd.y * L.restFoot.z * s,
       c.pos.z + _right.z * L.restFoot.x * s + c.fwd.z * L.restFoot.z * s,
     );
-    if (st.stance && st.footWorld.distanceToSq(_footRef) > (stride * 1.25 + tr.sizeM * 0.2) ** 2) {
+    const maxDev = Math.min(stride * 0.85, (L.upperLen + L.lowerLen) * s * 0.55) + tr.sizeM * 0.08;
+    if (st.stance && st.footWorld.distanceToSq(_footRef) > maxDev * maxDev) {
       replant(c, ctx, body, L, st, s, 0);
       st.fromWorld.copy(st.toWorld);
       st.footWorld.copy(st.toWorld);

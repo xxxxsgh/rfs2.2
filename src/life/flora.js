@@ -426,7 +426,7 @@ function buildImpostorMaterial(ctx) {
       #include <common>
       #include <fog_pars_vertex>
       #include <logdepthbuf_pars_vertex>
-      attribute vec4 aImp;      // x = largura, y = altura, z = linha do atlas, w = reserva
+      attribute vec4 aImp;      // x = largura, y = altura, z = linha, w = base do quad
       uniform float uCols;
       uniform float uRows;
       uniform vec3 uSunView;
@@ -454,9 +454,12 @@ function buildImpostorMaterial(ctx) {
         float ang = atan(dot(f, cross(upView, refView)), dot(f, refView));
         float tile = floor(fract(ang / 6.2831853 + 0.5 / uCols + 1.0) * uCols);
         vUvA = vec2((tile + uv.x) / uCols, (aImp.z + uv.y) / uRows);
+        // aImp.w desloca a base do quad: o bake enquadra a CAIXA da planta, que
+        // começa um pouco abaixo de y=0 (raízes) e sobe além do topo pela margem
+        // do tile. Sem esse offset a árvore distante flutuaria acima do chão.
         vec3 p = originView
                + right * (position.x * aImp.x * s)
-               + upView * (position.y * aImp.y * s);
+               + upView * ((position.y * aImp.y + aImp.w) * s);
         vec4 mvPosition = vec4(p, 1.0);
         vDist = -mvPosition.z;
         // Iluminação aproximada: mistura entre a face voltada à câmera e o topo.
@@ -687,22 +690,27 @@ function bakeImposters(ctx) {
 
   const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 1000);
 
+  const rt = S.impTarget;
   const prevRT = renderer.getRenderTarget();
   const prevAuto = renderer.autoClear;
   const prevShadow = renderer.shadowMap.enabled;
   const prevClear = new THREE.Color();
   renderer.getClearColor(prevClear);
   const prevAlpha = renderer.getClearAlpha();
-  const prevScissorTest = renderer.getScissorTest();
 
   try {
     renderer.shadowMap.enabled = false;
     renderer.autoClear = false;
-    renderer.setRenderTarget(S.impTarget);
+    // O recorte por tile vem do PRÓPRIO alvo, não de renderer.setViewport():
+    // este último multiplica por devicePixelRatio, o que estraria a grade do
+    // atlas em qualquer tela HiDPI.
+    rt.scissorTest = false;
+    rt.viewport.set(0, 0, w, h);
+    rt.scissor.set(0, 0, w, h);
+    renderer.setRenderTarget(rt);
     renderer.setClearColor(0x000000, 0);
-    renderer.setScissorTest(false);
     renderer.clear(true, true, false);
-    renderer.setScissorTest(true);
+    rt.scissorTest = true;
 
     for (let r = 0; r < rows; r++) {
       const sp = tall[r];
@@ -734,8 +742,9 @@ function bakeImposters(ctx) {
         rig.updateMatrixWorld(true);
 
         const px = c * IMP_TILE, py = r * IMP_TILE;
-        renderer.setViewport(px, py, IMP_TILE, IMP_TILE);
-        renderer.setScissor(px, py, IMP_TILE, IMP_TILE);
+        rt.viewport.set(px, py, IMP_TILE, IMP_TILE);
+        rt.scissor.set(px, py, IMP_TILE, IMP_TILE);
+        renderer.setRenderTarget(rt);   // reaplica viewport/scissor do alvo
         renderer.render(scene, cam);
       }
     }
@@ -745,9 +754,9 @@ function bakeImposters(ctx) {
   } catch (e) {
     S.matImp.uniforms.uAtlas.value = null;
   } finally {
-    renderer.setScissorTest(prevScissorTest);
-    renderer.setViewport(0, 0, ctx.engine.size.x, ctx.engine.size.y);
-    renderer.setScissor(0, 0, ctx.engine.size.x, ctx.engine.size.y);
+    rt.scissorTest = false;
+    rt.viewport.set(0, 0, w, h);
+    rt.scissor.set(0, 0, w, h);
     renderer.setRenderTarget(prevRT);
     renderer.setClearColor(prevClear, prevAlpha);
     renderer.autoClear = prevAuto;
@@ -1191,7 +1200,7 @@ function finalizeCell(ctx, cell) {
       ia[ao + 0] = sp.impWidth || sp.radius * 2;
       ia[ao + 1] = sp.impHeight || sp.height;
       ia[ao + 2] = sp.impRow;
-      ia[ao + 3] = 0;
+      ia[ao + 3] = sp.impBaseOffset || 0;
       impW = Math.max(impW, ia[ao + 1] * scale);
     } else {
       cell.impIdx[k] = -1;

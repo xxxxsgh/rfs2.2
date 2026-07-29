@@ -126,13 +126,24 @@ export async function init(ctx) {
 // ── Pool de workers ─────────────────────────────────────────────────────────
 
 function makePool(ctx) {
-  const want = Math.max(2, (navigator.hardwareConcurrency || 4) - 2);
+  const hc = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
+  const want = Math.max(2, hc - 2);
   for (let i = 0; i < want; i++) {
     try {
       const w = new Worker(new URL('./terrain-worker.js', import.meta.url), { type: 'module' });
-      const slot = { w, job: null, index: i };
+      const slot = { w, job: null, index: i, dead: false };
       w.onmessage = (ev) => onWorkerMessage(slot, ev.data);
-      w.onerror = () => { slot.job = null; };
+      w.onerror = () => {
+        // Worker que morre (módulo não carregou, MIME errado) não pode segurar
+        // o slot ocupado para sempre; e se TODOS morrerem, caímos no caminho
+        // síncrono em vez de deixar o planeta vazio.
+        if (slot.job) { S.workersBusy = Math.max(0, S.workersBusy - 1); slot.job = null; }
+        slot.dead = true;
+        if (S.pool.every((s) => s.dead)) {
+          S.syncMode = true;
+          ctx.debug.set('terreno.modo', 'síncrono (workers falharam)');
+        }
+      };
       S.pool.push(slot);
     } catch (e) {
       break;
@@ -155,6 +166,7 @@ function configureWorkers() {
     gen: S.gen,
   };
   for (let i = 0; i < S.pool.length; i++) {
+    if (S.pool[i].dead) continue;
     S.pool[i].job = null;
     S.pool[i].w.postMessage(msg);
   }
@@ -415,7 +427,7 @@ function dispatch(ctx) {
   if (S.syncMode) return;
   for (let i = 0; i < S.pool.length; i++) {
     const slot = S.pool[i];
-    if (slot.job) continue;
+    if (slot.job || slot.dead) continue;
     if (S.chunks.size >= MAX_LIVE_CHUNKS) break;
     const node = takeBest();
     if (!node) break;
@@ -713,7 +725,9 @@ export function edit(worldPos, radius, delta) {
   const brush = S.field.editMap.add(nx, ny, nz, radius, delta);
   const wire = { x: brush.x, y: brush.y, z: brush.z, ang: brush.ang, r: brush.r, delta: brush.delta };
   S.brushes.push(wire);
-  for (let i = 0; i < S.pool.length; i++) S.pool[i].w.postMessage({ type: 'edit', brush: wire });
+  for (let i = 0; i < S.pool.length; i++) {
+    if (!S.pool[i].dead) S.pool[i].w.postMessage({ type: 'edit', brush: wire });
+  }
 
   // Invalida tudo que a esfera do pincel toca. Edições são raras: uma varredura
   // completa da árvore é mais simples e mais segura que um índice espacial.

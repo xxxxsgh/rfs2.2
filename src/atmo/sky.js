@@ -35,14 +35,21 @@ import {
  * planeta. Ambos escrevem com `depthWrite: false` e `renderOrder` explícito,
  * para nunca apagarem luas e planetas que o módulo `universe` desenha lá.
  *
- * ── Por que DOIS passes na casca ────────────────────────────────────────────
- * Compor atmosfera sobre o fundo exige `L = fundo * T + inscatter`, com T
- * espectral (o pôr do sol avermelha o disco solar porque T.b << T.r). Blending
- * alfa só sabe multiplicar por um escalar. Então:
- *   passe A — blending multiplicativo, escreve T (uma leitura de LUT, barato);
- *   passe B — blending aditivo, escreve o in-scattering (raymarch).
- * O resultado é a composição fisicamente correta, e as estrelas somem do céu
- * diurno sozinhas, sem hack.
+ * ── Como a atmosfera é composta sobre o fundo ───────────────────────────────
+ * A casca escreve `L = inscatter + fundo * T` num único passe, com blending
+ * pré-multiplicado (src = 1, dst = 1 - srcAlpha) e `alpha = 1 - luminância(T)`.
+ * Assim as estrelas e as luas do `universe` desaparecem sozinhas sob o céu
+ * diurno, sem hack e sem passe extra. A extinção do fundo é escalar (o
+ * blending não sabe multiplicar por canal); o único objeto em que isso
+ * importaria é o disco solar, e ele recebe o MATIZ espectral já calculado na
+ * CPU (`sunColor`), de modo que o poente continua vermelho de verdade.
+ *
+ * ── Por que existe uma LUT de céu ───────────────────────────────────────────
+ * Marchar a atmosfera por pixel custa 35 milhões de amostras por frame a
+ * 1600x900. Como o in-scattering só depende do ângulo zenital e do azimute em
+ * relação ao sol, ele é pré-calculado uma vez por frame numa textura 192x108
+ * (Hillaire) e o passe de tela cheia vira uma leitura. Medido no arnês de
+ * captura (SwiftShader): 1739 ms/frame → 145 ms/frame, com os mesmos pixels.
  *
  * ── Ciclo dia/noite ─────────────────────────────────────────────────────────
  * O terreno não gira (é gerado no referencial do corpo), então quem gira é o
@@ -175,26 +182,24 @@ void main() {
   vec3 roR = (cameraPosition - uPlanetCenter) / uAtmoRadius;
   vec3 rd = normalize(vWorld - cameraPosition);
 
-#ifdef AETHER_PASS_TRANSMITTANCE
-  // Quanto do fundo (estrelas, sol, luas) sobrevive à travessia.
+  // Fora da atmosfera nesta direção não há o que compor — deixa o fundo intacto.
   vec3 hit = aetherSphere(roR, rd, uAtmoGeom.y);
   if (hit.z < 0.0 || hit.y <= 0.0) discard;
-  vec3 Tv;
+
+  // Quanto do fundo (estrelas, sol, luas) sobrevive à travessia.
+  float opacity;
   if (aetherGroundHit(roR, rd) > 0.0) {
-    Tv = vec3(0.0);                       // o corpo sólido bloqueia o fundo
+    opacity = 1.0;                         // o corpo sólido bloqueia o fundo
   } else {
     vec3 s = roR + rd * max(hit.x, 0.0);
     float rr = max(length(s), uAtmoGeom.x);
-    Tv = aetherTransmittance(rr, dot(s, rd) / rr);
+    vec3 Tv = aetherTransmittance(rr, dot(s, rd) / rr);
+    opacity = clamp(1.0 - dot(Tv, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
   }
-  gl_FragColor = vec4(Tv, 1.0);
-#else
-  // Uma leitura na LUT de céu do frame. O raymarch já foi pago, uma vez só,
-  // em 192x108 — aqui só resta reprojetar a direção.
-  vec3 hit2 = aetherSphere(roR, rd, uAtmoGeom.y);
-  if (hit2.z < 0.0 || hit2.y <= 0.0) discard;
-  gl_FragColor = vec4(max(aetherSkyView(rd), vec3(0.0)) * uSkyExposure, 1.0);
-#endif
+
+  // In-scattering: uma leitura na LUT de céu do frame.
+  vec3 inscat = max(aetherSkyView(rd), vec3(0.0)) * uSkyExposure;
+  gl_FragColor = vec4(inscat, opacity);
 
   #include <logdepthbuf_fragment>
 }
@@ -266,28 +271,9 @@ export async function init(ctx) {
   S.uniforms.uSkyExposure = { value: 1.0 };
   S.skyViewMat = S.luts.makeSkyViewMaterial(S.uniforms, { AETHER_SKY_STEPS: steps });
 
-  S.shellGeom = new THREE.SphereGeometry(1, 64, 32);
+  S.shellGeom = new THREE.SphereGeometry(1, 48, 24);
 
-  const matT = new THREE.ShaderMaterial({
-    uniforms: S.uniforms,
-    vertexShader: SHELL_VERT,
-    fragmentShader: SHELL_FRAG,
-    defines: { AETHER_PASS_TRANSMITTANCE: '' },
-    side: THREE.BackSide,
-    transparent: true,
-    depthWrite: false,
-    depthTest: true,
-    blending: THREE.CustomBlending,
-    blendSrc: THREE.ZeroFactor,
-    blendDst: THREE.SrcColorFactor,      // dst *= T  (espectral, por canal)
-    blendEquation: THREE.AddEquation,
-    // Alfa intocado: o alvo HDR usa o canal para outras coisas.
-    blendSrcAlpha: THREE.ZeroFactor,
-    blendDstAlpha: THREE.OneFactor,
-    blendEquationAlpha: THREE.AddEquation,
-  });
-
-  const matS = new THREE.ShaderMaterial({
+  const shellMat = new THREE.ShaderMaterial({
     uniforms: S.uniforms,
     vertexShader: SHELL_VERT,
     fragmentShader: SHELL_FRAG,
@@ -296,26 +282,22 @@ export async function init(ctx) {
     depthWrite: false,
     depthTest: true,
     blending: THREE.CustomBlending,
+    // Composição pré-multiplicada: dst = inscatter + dst * (1 - opacidade).
     blendSrc: THREE.OneFactor,
-    blendDst: THREE.OneFactor,           // dst += in-scattering
+    blendDst: THREE.OneMinusSrcAlphaFactor,
     blendEquation: THREE.AddEquation,
+    // Alfa do alvo intocado — o postfx pode usar o canal para outra coisa.
     blendSrcAlpha: THREE.ZeroFactor,
     blendDstAlpha: THREE.OneFactor,
     blendEquationAlpha: THREE.AddEquation,
   });
 
-  S.shellT = new THREE.Mesh(S.shellGeom, matT);
-  S.shellS = new THREE.Mesh(S.shellGeom, matS);
-  S.shellT.name = 'sky:extinction';
-  S.shellS.name = 'sky:inscatter';
+  S.shell = new THREE.Mesh(S.shellGeom, shellMat);
+  S.shell.name = 'sky:atmosphere';
   // Depois das nuvens e de qualquer transparência de superfície: a atmosfera é
   // a última camada de ar entre a cena e a câmera.
-  S.shellT.renderOrder = 1200;
-  S.shellS.renderOrder = 1201;
-  S.shellT.matrixAutoUpdate = true;
-  S.shellS.matrixAutoUpdate = true;
-  ctx.engine.scene.add(S.shellT);
-  ctx.engine.scene.add(S.shellS);
+  S.shell.renderOrder = 1200;
+  ctx.engine.scene.add(S.shell);
 
   // ── Discos solares no farScene ────────────────────────────────────────────
   const sunGeom = new THREE.PlaneGeometry(1, 1);

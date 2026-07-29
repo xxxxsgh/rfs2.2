@@ -207,15 +207,20 @@ export function createField(seed, terrainParams, opts = {}) {
         const gate = T.arches * land * above * lodFade;
         if (gate > 0.002) {
           const af = RADIUS / 240;             // padrão de ~240 m: vãos legíveis a pé
-          const depth = 70 + 110 * saturate(T.arches);
-          const steps = 6;
+          const depth = 80 + 150 * saturate(T.arches);
+          const steps = 7;
           const step = depth / steps;
+          // Marcha radial DESCENDO a partir da superfície: `open` é o quanto a
+          // coluna acima continua vazia. Enquanto o tubo 3D envolve a coluna,
+          // o material é removido; no primeiro nível sólido a marcha para.
+          // Onde o tubo passa ABAIXO da superfície, nada é cortado — e é
+          // exatamente essa alternância que deixa lombadas de rocha cruzando a
+          // fenda: as pontes naturais e os arcos.
           let open = 1, cut = 0;
           for (let k = 0; k < steps; k++) {
-            const v = archVoid(nx, ny, nz, (h - k * step) / 380, af);
-            cut += open * v * step;
-            open *= (1 - v);
-            if (open < 0.02) break;
+            open *= archVoid(nx, ny, nz, (h - k * step) / 380, af);
+            if (open < 0.03) break;
+            cut += open * step;
           }
           h -= cut * gate;
         }
