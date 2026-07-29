@@ -80,8 +80,11 @@ const S = {
   // Combustível de impulso simulado localmente (ver comentário em updateFuel).
   pulseFuel: 100,
 
-  // Cadência de redesenho dos mostradores
-  gaugeClock: 0,
+  // Cadência de redesenho dos mostradores. Começa "estourado" para que o
+  // PRIMEIRO frame visível já desenhe — senão a captura pega telas em branco.
+  gaugeClock: 1,
+  gaugeC: null, gaugeL: null, gaugeR: null,
+  buttons: null,
 
   envSeen: undefined,
 };
@@ -342,7 +345,9 @@ function drawCenter(gauge, d) {
 
   neonText(g, 'VELOCIDADE', 22, 34, '600 17px monospace', CY_DIM);
   neonText(g, d.speedTxt, 22, 88, '300 60px monospace', CY);
-  neonText(g, d.speedUnit, 24 + g.measureText(d.speedTxt).width * 0 + 200, 88, '600 20px monospace', AM);
+  // A unidade fica numa coluna FIXA: alinhá-la ao fim do número faria o rótulo
+  // dançar a cada dígito ganho ou perdido.
+  neonText(g, d.speedUnit, 224, 88, '600 20px monospace', AM);
 
   neonText(g, 'ALTITUDE', 22, 128, '600 15px monospace', AM_DIM);
   neonText(g, d.altTxt, 22, 166, '300 34px monospace', AM);

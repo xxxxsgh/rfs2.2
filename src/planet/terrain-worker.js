@@ -45,6 +45,7 @@ const IS_WORKER = typeof WorkerGlobalScope !== 'undefined' &&
 let _scratchN = 0;
 let _dirX = null, _dirY = null, _dirZ = null, _hh = null;
 let _nx = null, _ny = null, _nz = null, _slope = null;
+let _shadeC = null, _shadeM = null;
 
 function ensureScratch(N) {
   if (_scratchN === N) return;
@@ -53,6 +54,9 @@ function ensureScratch(N) {
   _hh = new Float64Array(n);
   _nx = new Float32Array(n); _ny = new Float32Array(n); _nz = new Float32Array(n);
   _slope = new Float32Array(n);
+  // Cor/material por vértice ÚNICO: o anel da saia repete o vértice de borda,
+  // e classificar + colorir de novo era ~11% do chunk gasto duas vezes.
+  _shadeC = new Uint16Array(n * 3); _shadeM = new Uint8Array(n * 4);
   _scratchN = N;
 }
 
@@ -68,6 +72,7 @@ const _mix = new Float32Array(4);
  * @returns {{payload:object, transfer:ArrayBuffer[]}}
  */
 export function buildChunk(job, field, pal, radius) {
+  const t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
   const res = job.resolution | 0;
   const N = res + 2;
   const total = N * N;
@@ -136,6 +141,27 @@ export function buildChunk(job, field, pal, radius) {
   let bsMinX = Infinity, bsMinY = Infinity, bsMinZ = Infinity;
   let bsMaxX = -Infinity, bsMaxY = -Infinity, bsMaxZ = -Infinity;
 
+  // Classificação + coloração APENAS dos vértices únicos (o miolo).
+  for (let j = 1; j < N - 1; j++) {
+    for (let i = 1; i < N - 1; i++) {
+      const s = j * N + i;
+      const h = _hh[s];
+      const cls = field.classify(_dirX[s], _dirY[s], _dirZ[s], h, _slope[s], _mix);
+      const o4 = s * 4;
+      _shadeM[o4] = (_mix[0] * 255) | 0;
+      _shadeM[o4 + 1] = (_mix[1] * 255) | 0;
+      _shadeM[o4 + 2] = (_mix[2] * 255) | 0;
+      _shadeM[o4 + 3] = (_mix[3] * 255) | 0;
+      // Ruído de vértice barato e determinístico para quebrar as faixas.
+      const varN = Math.sin((_dirX[s] * 911.7 + _dirY[s] * 573.3 + _dirZ[s] * 337.1) * radius * 0.021) * 0.5;
+      shadeVertex(_col, 0, pal, h / amp, _mix, varN, cls.moisture);
+      const o3 = s * 3;
+      _shadeC[o3] = clamp16(_col[0]);
+      _shadeC[o3 + 1] = clamp16(_col[1]);
+      _shadeC[o3 + 2] = clamp16(_col[2]);
+    }
+  }
+
   for (let j = 0; j < N; j++) {
     const sj = j < 1 ? 1 : (j > N - 2 ? N - 2 : j);
     for (let i = 0; i < N; i++) {
@@ -149,7 +175,7 @@ export function buildChunk(job, field, pal, radius) {
       const px = _dirX[s] * r - ox;
       const py = _dirY[s] * r - oy;
       const pz = _dirZ[s] * r - oz;
-      const o3 = k * 3;
+      const o3 = k * 3, s3 = s * 3;
       position[o3] = px; position[o3 + 1] = py; position[o3 + 2] = pz;
       normal[o3] = (_nx[s] * 32767) | 0;
       normal[o3 + 1] = (_ny[s] * 32767) | 0;
@@ -159,19 +185,14 @@ export function buildChunk(job, field, pal, radius) {
       if (py < bsMinY) bsMinY = py; if (py > bsMaxY) bsMaxY = py;
       if (pz < bsMinZ) bsMinZ = pz; if (pz > bsMaxZ) bsMaxZ = pz;
 
-      const cls = field.classify(_dirX[s], _dirY[s], _dirZ[s], h, _slope[s], _mix);
-      const o4 = k * 4;
-      matmix[o4] = (_mix[0] * 255) | 0;
-      matmix[o4 + 1] = (_mix[1] * 255) | 0;
-      matmix[o4 + 2] = (_mix[2] * 255) | 0;
-      matmix[o4 + 3] = (_mix[3] * 255) | 0;
-
-      // Ruído de vértice barato e determinístico para quebrar as faixas.
-      const varN = Math.sin((_dirX[s] * 911.7 + _dirY[s] * 573.3 + _dirZ[s] * 337.1) * radius * 0.021) * 0.5;
-      shadeVertex(_col, 0, pal, h / amp, _mix, varN, cls.moisture);
-      color[o3] = clamp16(_col[0]);
-      color[o3 + 1] = clamp16(_col[1]);
-      color[o3 + 2] = clamp16(_col[2]);
+      const o4 = k * 4, s4 = s * 4;
+      matmix[o4] = _shadeM[s4];
+      matmix[o4 + 1] = _shadeM[s4 + 1];
+      matmix[o4 + 2] = _shadeM[s4 + 2];
+      matmix[o4 + 3] = _shadeM[s4 + 3];
+      color[o3] = _shadeC[s3];
+      color[o3 + 1] = _shadeC[s3 + 1];
+      color[o3 + 2] = _shadeC[s3 + 2];
     }
   }
 
@@ -195,6 +216,9 @@ export function buildChunk(job, field, pal, radius) {
     origin: { x: ox, y: oy, z: oz },
     bs: { x: bcx, y: bcy, z: bcz, r: bsr },
     triangles: quads * 2,
+    // Telemetria do custo real do campo: é a medida que diz se a fila drena por
+    // ter menos chunks ou por cada chunk ficar mais barato.
+    buildMs: t0 ? (performance.now() - t0) : 0,
   };
   const transfer = [position.buffer, normal.buffer, color.buffer, matmix.buffer];
   return { payload, transfer };

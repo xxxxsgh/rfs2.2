@@ -30,13 +30,27 @@ export const id = 'planet';
 export const order = 30;
 
 const GRID_RES = 33;
-// k=2.2 num planeta de 150 km produz ~1200 folhas do solo. Com o índice
-// compartilhado e os atributos empacotados cada chunk custa ~34 KB, então o
-// teto abaixo equivale a ~55 MB de geometria viva.
-const MAX_LIVE_CHUNKS = 1600;
-const MAX_QUEUE = 600;
+/**
+ * k do critério de split. O nó divide quando `dist - lodR < k*arc`, e como
+ * `lodR = 0.72*arc` o alcance efetivo é `(k+0.72)*arc`. Com k=1.55 o triângulo
+ * na fronteira do LOD mede (1/32)/2.27 rad ≈ 0,8° — cerca de 11 px em 900 px de
+ * altura com 65° de campo. O k anterior (2.2) dava 8 px: detalhe que ninguém vê
+ * e que triplicava o número de nós, porque a árvore cresce com k².
+ */
+const SPLIT_FACTOR = 1.55;
+/** Teto duro de nós na árvore — válvula contra explosão em biomas extremos. */
+const MAX_NODES = 2600;
+// Com o índice compartilhado e os atributos empacotados cada chunk custa
+// ~34 KB, então o teto abaixo equivale a ~100 MB de geometria viva. Ele PRECISA
+// ficar acima de MAX_NODES: se o gerente pudesse encher de chunks até bater no
+// teto, `dispatch` travaria e a fila nunca mais drenaria — foi exatamente esse
+// o impasse que segurava 598 chunks pendentes indefinidamente.
+const MAX_LIVE_CHUNKS = MAX_NODES + 600;
+const MAX_QUEUE = 1200;
+/** Margem do frustum, em metros: o que está prestes a entrar no quadro. */
+const FRUSTUM_MARGIN = 600;
 const CHUNK_TTL_FRAMES = 420;      // ~7 s a 60 fps antes de descartar a malha
-const PRUNE_EVERY = 120;
+const PRUNE_EVERY = 90;
 
 const S = {
   ctx: null,
@@ -60,6 +74,9 @@ const S = {
   stats: { visible: 0, tris: 0, built: 0 },
   altAboveDatum: Infinity,
   lastNormalFrame: -999,
+  /** Média móvel do custo de um chunk no worker (ms) — telemetria da fila. */
+  buildMs: 0,
+  inFlight: 0,
 };
 
 // ── Escratch (zero alocação por frame) ──────────────────────────────────────
@@ -69,6 +86,11 @@ const _nrm = new THREE.Vector3();
 const _leaves = [];
 const _t1 = { x: 0, y: 0, z: 0 };
 const _t2 = { x: 0, y: 0, z: 0 };
+const _planes = new Float64Array(24);
+const _projView = new THREE.Matrix4();
+const _shift = new THREE.Matrix4();
+const _frustum = new THREE.Frustum();
+const _pick = [];
 
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -93,6 +115,27 @@ export async function init(ctx) {
     get material() { return S.matInfo ? S.matInfo.material : null; },
     get field() { return S.field; },
     get group() { return S.group; },
+    /**
+     * Chunks ainda por gerar: fila + jobs em voo. Lido por `src/core/shots.js`
+     * (`drainTerrain`) para saber quando o LOD convergiu — se contasse só a
+     * fila, a captura dispararia com os últimos chunks ainda dentro dos workers.
+     */
+    get pendingCount() { return S.queue.size + S.inFlight; },
+    /** Telemetria para o arnês de verificação. */
+    diag() {
+      return {
+        leaves: S.qs ? S.qs.leafCount : 0,
+        offscreenLeaves: S.qs ? S.qs.offscreenLeaves : 0,
+        nodes: S.qs ? S.qs.nodeCount : 0,
+        chunks: S.chunks.size,
+        visible: S.stats.visible,
+        queue: S.queue.size,
+        inFlight: S.inFlight,
+        workers: S.pool.length,
+        buildMs: Math.round(S.buildMs * 100) / 100,
+        built: S.stats.built,
+      };
+    },
     setActive,
     sampleHeight,
     sampleSurface,
@@ -127,7 +170,10 @@ export async function init(ctx) {
 
 function makePool(ctx) {
   const hc = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
-  const want = Math.max(2, hc - 2);
+  // Deixa UM núcleo para a thread principal (render + compositor). Reservar
+  // dois desperdiçava metade da máquina numa CPU de 4 núcleos — era um dos
+  // motivos de a fila não drenar.
+  const want = Math.max(2, Math.min(8, hc - 1));
   for (let i = 0; i < want; i++) {
     try {
       const w = new Worker(new URL('./terrain-worker.js', import.meta.url), { type: 'module' });
@@ -171,6 +217,7 @@ function configureWorkers() {
     S.pool[i].w.postMessage(msg);
   }
   S.workersBusy = 0;
+  S.inFlight = 0;
 }
 
 function chunkSeed(body) {
@@ -186,9 +233,18 @@ function onWorkerMessage(slot, m) {
     if (slot.job && slot.job.seq === m.seq) {
       slot.job = null;
       S.workersBusy = Math.max(0, S.workersBusy - 1);
+      S.inFlight = Math.max(0, S.inFlight - 1);
     }
   }
-  if (m.type === 'chunk') integrate(m);
+  if (m.type === 'chunk') {
+    if (m.buildMs > 0) S.buildMs = S.buildMs === 0 ? m.buildMs : S.buildMs * 0.92 + m.buildMs * 0.08;
+    integrate(m);
+  } else if (m.type === 'fail') {
+    // Sem isto o nó fica marcado como "pedido" para sempre e nunca mais é
+    // re-enfileirado: um buraco permanente no terreno.
+    const e = S.chunks.get(m.nodeId);
+    if (e && e.seq === m.seq && e.pending) S.chunks.delete(m.nodeId);
+  }
 }
 
 // ── Ciclo de vida do corpo ativo ────────────────────────────────────────────
@@ -221,7 +277,10 @@ function activate(body) {
   S.gen++;
   S.field = createField(chunkSeed(body), terrain, { radius });
   S.pal = createPalette(body.biome?.palette || {});
-  S.qs = new QuadSphere({ radius, amplitude, maxLevel, splitFactor: 2.2, gridRes: GRID_RES });
+  S.qs = new QuadSphere({
+    radius, amplitude, maxLevel, splitFactor: SPLIT_FACTOR, gridRes: GRID_RES,
+    maxNodes: MAX_NODES,
+  });
   // O culling de horizonte precisa de um raio GARANTIDAMENTE sólido. Usar
   // `radius - amplitude` é correto porém tão pessimista que quase nada é
   // ocultado; uma amostragem esférica barata dá um piso realista com margem.
@@ -266,6 +325,7 @@ function clearActive() {
   S.body = null;
   for (let i = 0; i < S.pool.length; i++) S.pool[i].job = null;
   S.workersBusy = 0;
+  S.inFlight = 0;
 }
 
 function disposeEntry(e) {
@@ -299,24 +359,62 @@ export function update(dt, ctx) {
   _camLocal.x = p.x - c.x; _camLocal.y = p.y - c.y; _camLocal.z = p.z - c.z;
 
   S.renderFrame++;
+  // O grupo é reposicionado aqui (e não só no lateUpdate) porque o frustum é
+  // extraído em espaço do planeta a partir de `group.position`: depois de um
+  // teleporte o rebase já aconteceu e usar a posição do frame anterior
+  // descartaria por um frame tudo o que está na frente da câmera.
+  repositionGroup();
   const bias = ctx.quality?.terrainLodBias || 1;
-  S.qs.select(_camLocal, _leaves, bias);
+  S.qs.select(_camLocal, _leaves, bias, updateFrustum(ctx));
 
   requestChunks();
   dispatch(ctx);
   if (S.syncMode) buildSync(ctx);
   render();
 
-  if ((S.renderFrame % PRUNE_EVERY) === 0) collect();
+  if ((S.renderFrame % PRUNE_EVERY) === 0 || S.chunks.size > MAX_LIVE_CHUNKS) collect();
 
   updatePlayerGround(ctx);
 
-  ctx.debug.set('terreno.folhas', _leaves.length);
+  ctx.debug.set('terreno.folhas', `${_leaves.length} (${S.qs.offscreenLeaves} fora)`);
   ctx.debug.set('terreno.chunks', `${S.stats.visible}/${S.chunks.size}`);
   ctx.debug.set('terreno.fila', S.queue.size);
   ctx.debug.set('terreno.tris', S.stats.tris);
   ctx.debug.set('terreno.workers', `${S.workersBusy}/${S.pool.length || 'sync'}`);
+  ctx.debug.set('terreno.ms/chunk', S.buildMs.toFixed(1));
   ctx.debug.set('terreno.nós', S.qs.nodeCount);
+}
+
+/**
+ * Planos do frustum em ESPAÇO DO PLANETA.
+ *
+ * A câmera vive em coordenadas da origem flutuante e os nós em coordenadas do
+ * planeta; as duas diferem apenas pela translação `group.position`, então basta
+ * compor essa translação antes de extrair os planos — nada de converter 2600
+ * centros de nó por frame.
+ *
+ * Cada plano é afastado por FRUSTUM_MARGIN para que o que está prestes a entrar
+ * no quadro já chegue refinado; sem essa folga, girar a câmera mostraria
+ * terreno grosso por meio segundo.
+ */
+function updateFrustum(ctx) {
+  const cam = ctx.engine?.camera;
+  if (!cam) return null;
+  cam.updateMatrixWorld();
+  _projView.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+  _shift.makeTranslation(S.group.position.x, S.group.position.y, S.group.position.z);
+  _projView.multiply(_shift);
+  _frustum.setFromProjectionMatrix(_projView);
+  for (let i = 0; i < 6; i++) {
+    const p = _frustum.planes[i];
+    const o = i * 4;
+    _planes[o] = p.normal.x;
+    _planes[o + 1] = p.normal.y;
+    _planes[o + 2] = p.normal.z;
+    _planes[o + 3] = p.constant + FRUSTUM_MARGIN;
+    if (!Number.isFinite(_planes[o] + _planes[o + 3])) return null;
+  }
+  return _planes;
 }
 
 export function lateUpdate(dt, ctx) {
@@ -371,40 +469,71 @@ function distTo(a, b) {
 // ── Fila e despacho ─────────────────────────────────────────────────────────
 
 function requestChunks() {
-  const maxLevel = S.qs.maxLevel;
+  const f = S.renderFrame;
   for (let i = 0; i < _leaves.length; i++) {
-    const leaf = _leaves[i];
-    if (S.chunks.has(leaf.id)) continue;      // já servida: nada a pedir
     // Pede a folha E os ancestrais sem malha: o ancestral é o fallback que
-    // impede um buraco enquanto a folha não chega. Para no primeiro ancestral
-    // que já tem malha — acima dele o fallback está garantido.
-    let n = leaf;
+    // impede um buraco enquanto a folha não chega. Para no primeiro nó que já
+    // tem malha — acima dele o fallback está garantido, e no caso comum (folha
+    // já servida) o laço termina na primeira iteração.
+    //
+    // O caminho inteiro é REAFIRMADO todo frame de propósito: é isso que deixa
+    // a varredura de cancelamento lá embaixo distinguir "ainda quero" de "não
+    // quero mais" sem precisar de bookkeeping por nó.
+    let n = _leaves[i];
     while (n) {
       const e = S.chunks.get(n.id);
       if (e) { if (e.mesh) break; n = n.parent; continue; }
-      const q = S.queue.get(n.id);
       // Prioridade por NÍVEL e, dentro do nível, por distância.
       // O conjunto desenhado só desce para os filhos quando os QUATRO estão
       // prontos (é o que evita buraco e sobreposição), então servir a fila em
       // largura faz o planeta refinar por camadas inteiras. Ordenar só por
       // distância deixaria folhas profundas prontas sem os irmãos, e nada
       // delas apareceria — trabalho feito e invisível.
-      const score = n.level * 3e6 + n._dist;
-      if (q) { if (score < q.score) q.score = score; }
-      else if (S.queue.size < MAX_QUEUE) S.queue.set(n.id, { node: n, score });
+      // O que está fora do frustum entra atrás de tudo do mesmo nível: o
+      // jogador vê o quadro convergir primeiro e só depois as costas.
+      const score = n.level * 3e6 + (n._offscreen ? 1.4e6 : 0) + n._dist;
+      const q = S.queue.get(n.id);
+      if (q) { q.frame = f; if (score < q.score) q.score = score; }
+      else if (S.queue.size < MAX_QUEUE) S.queue.set(n.id, { node: n, score, frame: f });
       n = n.parent;
     }
   }
+
+  // ── Cancelamento ────────────────────────────────────────────────────────
+  // O que não foi re-pedido neste frame saiu do conjunto desejado: a câmera
+  // girou, o LOD subiu de nível ou a árvore foi podada. Deixar essas entradas
+  // na fila faria os workers gastarem segundos produzindo malhas que ninguém
+  // mais vai inserir na cena — e era isso que mantinha a fila cheia com a
+  // câmera parada, porque o conjunto desejado muda a cada teleporte da captura.
+  if (S.queue.size) {
+    for (const [k, q] of S.queue) if (q.frame !== f) S.queue.delete(k);
+  }
 }
 
-function takeBest() {
-  let bestKey = -1, bestScore = Infinity, bestNode = null;
-  for (const [k, q] of S.queue) {
-    if (q.score < bestScore) { bestScore = q.score; bestKey = k; bestNode = q.node; }
+/**
+ * Devolve até `want` nós da fila em ordem de prioridade (melhor primeiro) e os
+ * remove. UMA varredura por lote em vez de uma por slot livre — com oito
+ * workers e mil entradas a diferença é linear vs. quadrática.
+ */
+const _pickScore = [];
+function takeBest(want) {
+  _pick.length = 0;
+  _pickScore.length = 0;
+  if (S.queue.size === 0 || want <= 0) return _pick;
+  for (const [, q] of S.queue) {
+    let i = _pick.length;
+    if (i >= want && q.score >= _pickScore[i - 1]) continue;
+    if (i < want) { _pick.push(q.node); _pickScore.push(q.score); i++; }
+    // Inserção por deslocamento: `want` é ≤ 8, um heap seria overhead puro.
+    let j = i - 1;
+    while (j > 0 && _pickScore[j - 1] > q.score) {
+      _pick[j] = _pick[j - 1]; _pickScore[j] = _pickScore[j - 1]; j--;
+    }
+    _pick[j] = q.node; _pickScore[j] = q.score;
+    if (_pick.length > want) { _pick.pop(); _pickScore.pop(); }
   }
-  if (bestKey < 0) return null;
-  S.queue.delete(bestKey);
-  return bestNode;
+  for (let i = 0; i < _pick.length; i++) S.queue.delete(_pick[i].id);
+  return _pick;
 }
 
 function makeJob(node) {
@@ -425,16 +554,27 @@ function makeJob(node) {
 
 function dispatch(ctx) {
   if (S.syncMode) return;
+  let free = 0;
   for (let i = 0; i < S.pool.length; i++) {
+    const s = S.pool[i];
+    if (!s.job && !s.dead) free++;
+  }
+  if (free === 0) return;
+  // O teto de malhas vivas nunca pode BLOQUEAR o despacho: liberar as frias é o
+  // que mantém a fila drenando quando a árvore está no limite.
+  if (S.chunks.size + free > MAX_LIVE_CHUNKS) collect();
+
+  const picked = takeBest(free);
+  let ki = 0;
+  for (let i = 0; i < S.pool.length && ki < picked.length; i++) {
     const slot = S.pool[i];
     if (slot.job || slot.dead) continue;
-    if (S.chunks.size >= MAX_LIVE_CHUNKS) break;
-    const node = takeBest();
-    if (!node) break;
-    if (S.chunks.has(node.id)) continue;
+    const node = picked[ki++];
+    if (S.chunks.has(node.id)) { i--; continue; }
     const job = makeJob(node);
     slot.job = job;
     S.workersBusy++;
+    S.inFlight++;
     slot.w.postMessage(job);
   }
 }
@@ -443,8 +583,9 @@ function dispatch(ctx) {
 function buildSync(ctx) {
   let guard = 4;
   while (guard-- > 0 && ctx.budget.canWork() && S.chunks.size < MAX_LIVE_CHUNKS) {
-    const node = takeBest();
-    if (!node) break;
+    const picked = takeBest(1);
+    if (picked.length === 0) break;
+    const node = picked[0];
     if (S.chunks.has(node.id)) continue;
     const job = makeJob(node);
     try {
@@ -558,14 +699,17 @@ function collect() {
     S.queue.delete(node.id);
   });
 
-  if (S.chunks.size <= MAX_LIVE_CHUNKS) return;
-  // Acima do teto: descarta as malhas mais antigas que não estão em cena.
+  const soft = MAX_LIVE_CHUNKS * 0.86;
+  if (S.chunks.size <= soft) return;
+  // Acima do teto: descarta as malhas mais antigas que não estão em cena. Corta
+  // até FOLGADAMENTE abaixo do teto — parar exatamente nele faria `dispatch`
+  // chamar `collect` a cada frame para liberar um único slot.
   const cold = [];
   for (const [k, e] of S.chunks) {
-    if (e.mesh && S.renderFrame - e.lastSeen > 60) cold.push([k, e]);
+    if (e.mesh && S.renderFrame - e.lastSeen > 30) cold.push([k, e]);
   }
   cold.sort((a, b) => a[1].lastSeen - b[1].lastSeen);
-  const drop = Math.min(cold.length, S.chunks.size - MAX_LIVE_CHUNKS);
+  const drop = Math.min(cold.length, Math.ceil(S.chunks.size - soft));
   for (let i = 0; i < drop; i++) { disposeEntry(cold[i][1]); S.chunks.delete(cold[i][0]); }
 }
 

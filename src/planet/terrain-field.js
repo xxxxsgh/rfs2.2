@@ -29,7 +29,7 @@
 
 import {
   Noise, saturate, lerp, smoothstep, clamp, smin, smax,
-  erode, terrace as terraceCurve, plateau as plateauCurve,
+  terrace as terraceCurve, plateau as plateauCurve,
 } from '../noise/noise.js';
 import { hashString, hashInt, mix as hmix } from '../core/rng.js';
 import { directionToFaceUV } from './quadsphere.js';
@@ -41,13 +41,97 @@ const FALLBACK = {
   plateau: 0.0, detailAmp: 14, cliffSlope: 0.62,
 };
 
-const DETAIL_OCTAVES = 9;
+const DETAIL_OCTAVES = 7;
 const DETAIL_BASE_LAMBDA = 1400;   // maior comprimento de onda do detalhe (m)
 const DETAIL_GAIN = 0.52;
 
 function seedOf(seed, tag) {
   const base = typeof seed === 'number' ? hashInt(seed) : hashString(String(seed));
   return hmix(base, hashString(tag));
+}
+
+// ── Primitivas locais de ruído ──────────────────────────────────────────────
+//
+// POR QUÊ não chamar `Noise.fbm`/`Noise.ridged` diretamente:
+//
+//  1. LIMITE DE BANDA. Cada nó do quadtree amostra o campo a cada `cell`
+//     metros. Uma oitava cujo comprimento de onda é menor que ~2·cell não é
+//     representável pela malha: somá-la é trabalho jogado fora E vira aliasing
+//     que "ferve" quando o LOD troca de nível. Aqui cada oitava entra com um
+//     peso que cai suavemente ao chegar em Nyquist, e o laço PARA quando o peso
+//     zera. Num chunk de nível 0 (célula de 7 km) isso corta metade das
+//     avaliações; num de nível 14 não corta nada — exatamente onde deve.
+//  2. NORMALIZAÇÃO FIXA. A soma de referência é a de TODAS as oitavas
+//     possíveis. Se dependesse das oitavas efetivamente somadas, a amplitude
+//     cresceria ao cortar oitavas e o relevo "respiraria" a cada troca de LOD.
+//  3. SEM `Math.pow`. O expoente de nitidez das cristas custava um `pow` por
+//     oitava — medido, quase o mesmo que uma amostra de simplex inteira. As
+//     variantes abaixo usam multiplicação e raiz quadrada.
+
+/** Soma de referência das amplitudes (normalização fixa). */
+function ampNorm(octaves, gain) {
+  let a = 1, s = 0;
+  for (let k = 0; k < octaves; k++) { s += a; a *= gain; }
+  return s;
+}
+
+/**
+ * Peso da oitava de frequência relativa `f` dado o Nyquist relativo `nyq`.
+ * Fade em vez de corte seco: dois níveis vizinhos de LOD nunca podem diferir
+ * por um degrau na junta.
+ */
+function bandW(f, nyq) {
+  if (f <= nyq * 0.5) return 1;
+  if (f >= nyq) return 0;
+  const t = (nyq - f) / (nyq * 0.5);
+  return t * t * (3 - 2 * t);
+}
+
+/** fBm com limite de banda. `x,y,z` já vêm multiplicados pela frequência base. */
+function fbmB(n, x, y, z, oct, gain, norm, nyq) {
+  let a = 1, f = 1, s = 0;
+  for (let k = 0; k < oct; k++) {
+    const w = bandW(f, nyq);
+    if (w <= 0) break;
+    s += a * w * n.noise3(x * f, y * f, z * f);
+    a *= gain; f *= 2;
+  }
+  return s / norm;
+}
+
+/**
+ * fBm ridged com limite de banda. `sharp` afia a crista (o ridged cru deixa
+ * cumes gordos demais); a modulação pela oitava anterior é o que produz vales
+ * largos com cristas finas.
+ */
+function ridgedB(n, x, y, z, oct, lac, gain, norm, nyq, sharp) {
+  let a = 1, f = 1, s = 0, prev = 1;
+  for (let k = 0; k < oct; k++) {
+    const w = bandW(f, nyq);
+    if (w <= 0) break;
+    const u = 1 - Math.abs(n.noise3(x * f, y * f, z * f));
+    // `sharp` é um CÓDIGO inteiro, não uma função: um callback aqui tornaria o
+    // ponto de chamada megamórfico (quatro closures diferentes usam este laço)
+    // e o JIT deixaria de embutir a potência no caminho quente.
+    const v = sharp === 0 ? u
+      : sharp === 1 ? u * Math.sqrt(u)
+      : sharp === 2 ? u * u
+      : sharp === 3 ? u * u * Math.sqrt(u)
+      : u * u * u;
+    s += a * w * v * prev;
+    prev = v;
+    a *= gain; f *= lac;
+  }
+  return s / norm;
+}
+
+/** Expoente de nitidez quantizado nas potências que saem sem `Math.pow`. */
+function makeSharp(p) {
+  if (p <= 1.15) return 0;      // ^1
+  if (p <= 1.75) return 1;      // ^1.5
+  if (p <= 2.25) return 2;      // ^2
+  if (p <= 2.75) return 3;      // ^2.5
+  return 4;                     // ^3
 }
 
 /**
@@ -72,20 +156,65 @@ export function createField(seed, terrainParams, opts = {}) {
   const nClim = new Noise(seedOf(seed, 'climate'));
   const nRock = new Noise(seedOf(seed, 'rock'));
 
-  // Normalização fixa do detalhe: se dependesse das oitavas efetivamente
-  // somadas, a amplitude cresceria ao diminuir o LOD e o terreno "respiraria".
-  let detailNorm = 0;
-  { let a = 1; for (let k = 0; k < DETAIL_OCTAVES; k++) { detailNorm += a; a *= DETAIL_GAIN; } }
+  // ── Frequências base, em ciclos por unidade de DIREÇÃO ────────────────────
+  // Um ciclo aqui vale `RADIUS/f` metros de arco. Guardadas fora do laço porque
+  // são reavaliadas centenas de milhares de vezes por chunk.
+  const F_WARP = CF * 0.62;
+  const F_UND = CF * 3.1;
+  const F_PLATE = CF * 2.4;
+  const F_RIDGE = CF * 4.2;
+  const F_FOOT = F_RIDGE * 2.6;
+  const F_CANW = CF * 2.2;
+  const F_CANY = CF * 9.5;
+  const F_CLIM = CF * 1.9;
+  const F_ROCK = CF * 26;
+  const F_EROD = CF * 7 * 3.1;
+
+  const WARP_S = 0.55 + WARP * 0.75;
+  const sharpRidge = makeSharp(T.ridgeSharpness);
+  const sharpFoot = makeSharp(1.1);
+  const sharpCanyon = makeSharp(2.6);
+  const sharpChannel = makeSharp(2.0);
+
+  const N_CONT = ampNorm(5, 0.5);
+  const N_UND = ampNorm(3, 0.5);
+  const N_RIDGE = ampNorm(7, 0.5);
+  const N_FOOT = ampNorm(4, 0.5);
+  const N_CANW = ampNorm(2, 0.5);
+  const N_CANY = ampNorm(4, 0.5);
+  const N_CLIM = ampNorm(3, 0.5);
+  const N_ROCK = ampNorm(2, 0.5);
+  const N_CHAN = ampNorm(3, 0.5);
+  const detailNorm = ampNorm(DETAIL_OCTAVES, DETAIL_GAIN);
 
   // Canais laterais do macro-campo: evitam alocar um objeto por amostra.
   let _land = 0, _plateEdge = 0, _cont = 0, _ridge = 0;
 
   const editMap = createEditMap(RADIUS);
 
-  /** Continentes + cordilheiras, normalizado [0,1]. Escreve os canais laterais. */
-  function macroE(x, y, z) {
-    // ── 1. continentes ──────────────────────────────────────────────────────
-    const cont = nCont.warped2(x * CF, y * CF, z * CF, 5, 0.55 + WARP * 0.75);
+  /**
+   * Continentes + cordilheiras, normalizado [0,1]. Escreve os canais laterais.
+   * `nyq` é a maior frequência (em ciclos por unidade de direção) que a malha
+   * do LOD ainda representa.
+   */
+  function macroE(x, y, z, nyq) {
+    // ── 1. continentes: domain warping em DUAS passadas ─────────────────────
+    // O `warped2` do noise.js custava 29 amostras de simplex por vértice — 20%
+    // do orçamento do chunk. A estrutura em fita (penínsulas, baías, istmos)
+    // que ele produz vem da SEGUNDA passada de warp, não das oitavas internas
+    // de cada deslocamento. Duas passadas de uma oitava dão a mesma assinatura
+    // por um terço do custo.
+    const xw = x * F_WARP, yw = y * F_WARP, zw = z * F_WARP;
+    const q1 = nCont.noise3(xw + 13.7, yw + 5.1, zw + 9.3);
+    const q2 = nCont.noise3(xw - 7.3, yw + 11.9, zw - 2.7);
+    const q3 = nCont.noise3(xw + 3.3, yw - 8.5, zw + 17.1);
+    const s2 = WARP_S * 1.6;
+    const r1 = nCont.noise3(xw * 2.1 + s2 * q1 + 1.7, yw * 2.1 + s2 * q2 + 9.2, zw * 2.1 + s2 * q3 + 4.4);
+    const r2 = nCont.noise3(xw * 2.1 + s2 * q2 + 8.3, yw * 2.1 + s2 * q3 + 2.8, zw * 2.1 + s2 * q1 + 1.1);
+    const r3 = nCont.noise3(xw * 2.1 + s2 * q3 + 3.9, yw * 2.1 + s2 * q1 + 6.6, zw * 2.1 + s2 * q2 + 7.2);
+    const dx = WARP_S * (q1 * 0.55 + r1), dy = WARP_S * (q2 * 0.55 + r2), dz = WARP_S * (q3 * 0.55 + r3);
+    const cont = fbmB(nCont, x * CF + dx, y * CF + dy, z * CF + dz, 5, 0.5, N_CONT, nyq / CF);
+
     const land = smoothstep(-0.09, 0.20, cont);
     const shelf = smoothstep(-0.42, -0.06, cont);
 
@@ -96,27 +225,29 @@ export function createField(seed, terrainParams, opts = {}) {
     e = lerp(e, inland, land);
 
     // Ondulação continental ampla: impede que o interior vire um platô morto.
-    e += nCont.fbm(x * CF * 3.1 + 7.3, y * CF * 3.1 - 2.1, z * CF * 3.1 + 4.9, 5) *
+    e += fbmB(nCont, x * F_UND + 7.3, y * F_UND - 2.1, z * F_UND + 4.9, 3, 0.5, N_UND, nyq / F_UND) *
          0.055 * (0.35 + 0.65 * land);
 
     // ── 2. cordilheiras alinhadas às "placas" ───────────────────────────────
-    const w = nPlate.worley(x * CF * 2.4 + 13.1, y * CF * 2.4 - 5.7, z * CF * 2.4 + 2.3, 1.0);
+    const w = nPlate.worley(x * F_PLATE + 13.1, y * F_PLATE - 5.7, z * F_PLATE + 2.3, 1.0);
     const edge = 1 - smoothstep(0.0, 0.30, w.f2 - w.f1);
     const chain = 0.14 + 0.86 * edge * edge;
 
-    const wq = nRidge.fbm(x * CF * 1.7, y * CF * 1.7, z * CF * 1.7, 3) * WARP * 0.35;
-    const rf = CF * 4.2;
-    const ridge = nRidge.ridged(
-      x * rf + wq * 3.0, y * rf - wq * 2.1, z * rf + wq * 1.4,
-      7, 2.03, 0.5, T.ridgeSharpness,
+    // Warp da cordilheira: uma oitava basta, o papel dela é só tirar a serra do
+    // eixo do ruído para as cristas não saírem paralelas.
+    const wq = nRidge.noise3(x * CF * 1.7, y * CF * 1.7, z * CF * 1.7) * WARP * 0.35;
+    const ridge = ridgedB(
+      nRidge, x * F_RIDGE + wq * 3.0, y * F_RIDGE - wq * 2.1, z * F_RIDGE + wq * 1.4,
+      7, 2.03, 0.5, N_RIDGE, nyq / F_RIDGE, sharpRidge,
     );
-    // Expoente >1 afina os cumes (o ridged cru deixa cristas gordas demais) sem
-    // roubar altura: o fator 1.55 existe para o relevo OCUPAR a amplitude do
-    // bioma. Serra que só usa 30% do orçamento vertical lê como colina.
-    e += Math.pow(ridge, 1.55) * T.ridgeWeight * chain * (0.25 + 0.75 * land) * 1.55;
+    // Expoente >1 afina os cumes sem roubar altura: o fator existe para o relevo
+    // OCUPAR a amplitude do bioma. Serra que só usa 30% do orçamento vertical
+    // lê como colina. `r*sqrt(r)` = pow(r,1.5) sem pagar `Math.pow`.
+    e += ridge * Math.sqrt(ridge) * T.ridgeWeight * chain * (0.25 + 0.75 * land) * 1.62;
 
     // Contrafortes: uma banda intermediária amarra o pé da serra ao planalto.
-    e += nRidge.ridged(x * rf * 2.6 + 4.1, y * rf * 2.6 - 9.7, z * rf * 2.6 + 1.9, 4, 2.1, 0.5, 1.1) *
+    e += ridgedB(nRidge, x * F_FOOT + 4.1, y * F_FOOT - 9.7, z * F_FOOT + 1.9,
+                 4, 2.1, 0.5, N_FOOT, nyq / F_FOOT, sharpFoot) *
          T.ridgeWeight * land * chain * 0.14;
 
     // Teto e piso SUAVES. Um clamp duro criaria mesas planas nos cumes dos
@@ -128,16 +259,40 @@ export function createField(seed, terrainParams, opts = {}) {
     return e;
   }
 
-  /** Proxy barato do relevo — só para o gradiente da erosão (6 avaliações). */
+  /**
+   * Proxy do relevo usado SÓ para o gradiente da erosão.
+   *
+   * A versão anterior gastava fbm(3)+ridged(4) = 7 amostras, e como o gradiente
+   * custa 4 avaliações isso dava 28 amostras por vértice — o item mais caro do
+   * campo inteiro, mais que o warping continental. A erosão só usa a MAGNITUDE
+   * do gradiente para decidir "encosta ou fundo de vale"; três oitavas na
+   * frequência da serra bastam para essa decisão.
+   */
   function proxyE(x, y, z) {
-    const c = nCont.fbm(x * CF, y * CF, z * CF, 3);
-    const rf = CF * 4.2;
-    const r = nRidge.ridged(x * rf, y * rf, z * rf, 4, 2.03, 0.5, T.ridgeSharpness);
-    return c * 0.30 + r * r * T.ridgeWeight * 0.62;
+    const a = nRidge.noise3(x * F_RIDGE, y * F_RIDGE, z * F_RIDGE);
+    const b = nRidge.noise3(x * F_RIDGE * 2.03, y * F_RIDGE * 2.03, z * F_RIDGE * 2.03);
+    const r = (1 - Math.abs(a)) * (0.66 + 0.34 * (1 - Math.abs(b)));
+    return nCont.noise3(x * CF, y * CF, z * CF) * 0.30 + r * r * T.ridgeWeight * 0.62;
   }
 
   const GRAD_EPS = 0.0016;
   const GRAD_SCALE = 1 / (6 + CF * 4);
+
+  /**
+   * Erosão hidráulica aproximada (inline: a versão de `noise.js` pedia um
+   * `ridged` de 4 oitavas com `Math.pow` por oitava).
+   * Onde o gradiente é forte a água escoou e desgastou a crista; onde é fraco,
+   * o sedimento se acumulou e canais finos cortam o fundo. É o passo que produz
+   * os vales em V da silhueta.
+   */
+  function erodeE(e, slope, x, y, z, strength, nyq) {
+    const flow = saturate(1 - slope * 1.5);
+    const channel = 1 - ridgedB(nCanyon, x * F_EROD + 21.7, y * F_EROD - 4.3, z * F_EROD + 8.9,
+                                3, 2.1, 0.5, N_CHAN, nyq / F_EROD, sharpChannel);
+    const cut = channel * flow * flow * 0.06 * strength;
+    const smoothing = 1 - saturate(slope * 0.35) * 0.18 * strength;
+    return e * smoothing - cut;
+  }
 
   /** Campo 3D dos arcos: a altitude entra como deslocamento real do domínio. */
   function archVoid(x, y, z, q, af) {
@@ -146,7 +301,7 @@ export function createField(seed, terrainParams, opts = {}) {
     // Interseção de duas superfícies de nível = TUBO. Um tubo horizontal logo
     // abaixo da crista é exatamente o vão de um arco natural.
     const tube = (1 - Math.abs(a)) * (1 - Math.abs(b));
-    return smoothstep(0.72, 0.93, tube);
+    return smoothstep(0.58, 0.86, tube);
   }
 
   /**
@@ -156,8 +311,12 @@ export function createField(seed, terrainParams, opts = {}) {
    */
   function height(nx, ny, nz, cell) {
     const c = cell > 0 ? cell : 1;
+    // Maior frequência que a malha ainda representa, em ciclos por unidade de
+    // direção. Um ciclo vale RADIUS/f metros; exigimos ~1,1 célula por ciclo no
+    // corte total e 2,2 para peso cheio.
+    const nyq = RADIUS / (1.1 * c);
 
-    let e = macroE(nx, ny, nz);
+    let e = macroE(nx, ny, nz, nyq);
     const land = _land;
 
     // ── 3. erosão ───────────────────────────────────────────────────────────
@@ -167,7 +326,8 @@ export function createField(seed, terrainParams, opts = {}) {
     const gx = (proxyE(nx + GRAD_EPS, ny, nz) - p0) / GRAD_EPS * GRAD_SCALE;
     const gy = (proxyE(nx, ny + GRAD_EPS, nz) - p0) / GRAD_EPS * GRAD_SCALE;
     const gz = (proxyE(nx, ny, nz + GRAD_EPS) - p0) / GRAD_EPS * GRAD_SCALE;
-    e = erode(nCanyon, e, gx, gy, gz, nx * CF * 7, ny * CF * 7, nz * CF * 7, 0.55 + land * 0.85);
+    const slope = Math.sqrt(gx * gx + gy * gy + gz * gz);
+    e = erodeE(e, slope, nx, ny, nz, 0.55 + land * 0.85, nyq);
 
     // ── 4. terraços e platôs ────────────────────────────────────────────────
     if (T.terraces > 0) {
@@ -180,19 +340,25 @@ export function createField(seed, terrainParams, opts = {}) {
     }
 
     // ── 5. cânions ──────────────────────────────────────────────────────────
-    const cw = nCanyon.fbm(nx * CF * 2.2 + 3.7, ny * CF * 2.2, nz * CF * 2.2 - 6.1, 3) * WARP * 0.5;
-    const cnf = CF * 9.5;
-    const cn = nCanyon.ridged(nx * cnf + cw, ny * cnf - cw * 0.7, nz * cnf + cw * 1.3, 5, 2.11, 0.5, 2.6);
-    // Só o topo do ridged vira linha: dá uma fenda ESTREITA, não um vale largo.
-    const line = smoothstep(0.80, 0.965, cn);
-    const wall = line * line * line;         // perfil quase vertical nas bordas
-    const altOk = smoothstep(SEA + 0.02, SEA + 0.16, e) * (1 - smoothstep(0.72, 0.94, e));
-    e -= wall * altOk * land * 0.21;
+    // A fenda tem ~RADIUS/F_CANY de largura característica; quando a célula do
+    // LOD passa disso ela não cabe na malha e só produziria ruído vertical.
+    const canyonLod = 1 - smoothstep(RADIUS / F_CANY * 0.05, RADIUS / F_CANY * 0.30, c);
+    if (canyonLod > 0.002) {
+      const cw = fbmB(nCanyon, nx * F_CANW + 3.7, ny * F_CANW, nz * F_CANW - 6.1,
+                      2, 0.5, N_CANW, nyq / F_CANW) * WARP * 0.5;
+      const cn = ridgedB(nCanyon, nx * F_CANY + cw, ny * F_CANY - cw * 0.7, nz * F_CANY + cw * 1.3,
+                         4, 2.11, 0.5, N_CANY, nyq / F_CANY, sharpCanyon);
+      // Só o topo do ridged vira linha: dá uma fenda ESTREITA, não um vale largo.
+      const line = smoothstep(0.78, 0.955, cn);
+      const wall = line * line * line;       // perfil quase vertical nas bordas
+      const altOk = smoothstep(SEA + 0.02, SEA + 0.16, e) * (1 - smoothstep(0.72, 0.94, e));
+      e -= wall * altOk * land * canyonLod * 0.23;
+    }
 
     // ── conversão para metros ───────────────────────────────────────────────
     let h = (e - SEA) * AMP;
 
-    // ── 6. arcos e pontes naturais ──────────────────────────────────────────
+    // ── 6. arcos, fendas e pontes naturais ──────────────────────────────────
     // Só existem acima do mar e desaparecem suavemente quando a célula do LOD
     // é grande demais para representá-los (fade, nunca corte seco → sem pop).
     if (T.arches > 0.001) {
@@ -201,26 +367,30 @@ export function createField(seed, terrainParams, opts = {}) {
       // vizinhos de níveis diferentes chegaria a metros e apareceria como um
       // degrau na silhueta. Espalhando o fade por uma década, o degrau em
       // qualquer junta fica abaixo do meio metro.
-      const lodFade = 1 - smoothstep(25, 260, c);
+      const lodFade = 1 - smoothstep(25, 300, c);
       if (lodFade > 0.001) {
         const above = saturate(h / (AMP * 0.08 + 30));
         const gate = T.arches * land * above * lodFade;
         if (gate > 0.002) {
           const af = RADIUS / 240;             // padrão de ~240 m: vãos legíveis a pé
-          const depth = 80 + 150 * saturate(T.arches);
-          const steps = 7;
+          const depth = 90 + 240 * saturate(T.arches);
+          const steps = 6;
           const step = depth / steps;
-          // Marcha radial DESCENDO a partir da superfície: `open` é o quanto a
-          // coluna acima continua vazia. Enquanto o tubo 3D envolve a coluna,
-          // o material é removido; no primeiro nível sólido a marcha para.
-          // Onde o tubo passa ABAIXO da superfície, nada é cortado — e é
-          // exatamente essa alternância que deixa lombadas de rocha cruzando a
-          // fenda: as pontes naturais e os arcos.
-          let open = 1, cut = 0;
+          // Marcha radial DESCENDO a partir da superfície. `v` é o quanto
+          // AQUELE nível está vazio; enquanto houver vazio o material sai e a
+          // marcha para no primeiro nível sólido. Onde o tubo 3D passa ABAIXO
+          // da superfície nada é cortado — é essa alternância que deixa
+          // lombadas de rocha cruzando a fenda: as pontes naturais e os arcos.
+          //
+          // BUG CORRIGIDO: a versão anterior acumulava `open *= v`. O produto
+          // colapsa já no primeiro passo (v raramente chega a 1), então o vão
+          // fechava imediatamente e nenhum arco chegava a aparecer. Os níveis
+          // da coluna são independentes; multiplicá-los não tinha sentido.
+          let cut = 0;
           for (let k = 0; k < steps; k++) {
-            open *= archVoid(nx, ny, nz, (h - k * step) / 380, af);
-            if (open < 0.03) break;
-            cut += open * step;
+            const v = archVoid(nx, ny, nz, (h - k * step) / 380, af);
+            if (v < 0.04) break;
+            cut += v * step;
           }
           h -= cut * gate;
         }
@@ -257,13 +427,16 @@ export function createField(seed, terrainParams, opts = {}) {
     const rel = h / AMP;
     const lat = Math.abs(ny);
 
-    const climate = nClim.fbm(nx * CF * 1.9 - 11.3, ny * CF * 1.9 + 6.7, nz * CF * 1.9 + 2.9, 5);
+    // 3 oitavas em vez de 5: o clima só decide faixas de bioma, e as oitavas
+    // finas eram invisíveis depois da mistura por altura no shader.
+    const climate = fbmB(nClim, nx * F_CLIM - 11.3, ny * F_CLIM + 6.7, nz * F_CLIM + 2.9,
+                         3, 0.5, N_CLIM, 1e9);
     // Lapso adiabático: o topo é frio mesmo no equador — cumes nevados.
     const temperature = saturate(1.06 - 1.42 * lat * lat - saturate(rel) * 0.62 + climate * 0.14);
     const moisture = saturate(0.5 + 0.55 * climate - saturate(rel) * 0.28 +
                               (1 - saturate(h / 40 + 0.5)) * 0.25);
 
-    const rockN = nRock.fbm(nx * CF * 26, ny * CF * 26, nz * CF * 26, 4);
+    const rockN = fbmB(nRock, nx * F_ROCK, ny * F_ROCK, nz * F_ROCK, 2, 0.5, N_ROCK, 1e9);
     const rockiness = saturate(smoothstep(T.cliffSlope - 0.20, T.cliffSlope + 0.10,
                                           slope01 + rockN * 0.13));
 

@@ -98,14 +98,30 @@ export class QuadSphere {
    * @param {number} o.splitFactor k do critério de split (≈2.2)
    * @param {number} o.gridRes     vértices por lado da malha de um nó
    */
-  constructor({ radius = 150000, amplitude = 3000, maxLevel = 14, splitFactor = 2.2, gridRes = 33 } = {}) {
+  constructor({
+    radius = 150000, amplitude = 3000, maxLevel = 14, splitFactor = 1.55,
+    gridRes = 33, offscreenFactor = 0.26, maxNodes = 2600,
+  } = {}) {
     this.radius = radius;
     this.amplitude = amplitude;
     this.maxLevel = maxLevel;
     this.splitFactor = splitFactor;
     this.gridRes = gridRes;
+    /**
+     * Quanto do critério de split sobra para um nó FORA do frustum. Ele não
+     * pode ser zero: o chão sob os pés, o que está atrás e o que projeta sombra
+     * precisam existir, e `waitReady` sonda o entorno da câmera. Mas refinar
+     * 360° do planeta até o nível final para mostrar ~1/5 disso é o que fazia a
+     * fila crescer mais rápido do que os workers conseguiam drenar.
+     */
+    this.offscreenFactor = offscreenFactor;
+    /** Válvula de segurança: teto duro de nós vivos na árvore. */
+    this.maxNodes = maxNodes;
     this.frame = 0;
     this.nodeCount = 0;
+    this.leafCount = 0;
+    this.offscreenLeaves = 0;
+    this._planes = null;
     /** Menor raio garantidamente sólido — usado no culling de horizonte. */
     this.solidRadius = radius - amplitude;
     this.roots = [];
@@ -136,6 +152,7 @@ export class QuadSphere {
       lastSeen: this.frame,
       _split: false,
       _culled: false,
+      _offscreen: false,
       _dist: Infinity,
       _readyFrame: -1,
       _ready: false,
@@ -210,20 +227,42 @@ export class QuadSphere {
   }
 
   /**
+   * O nó está INTEIRAMENTE fora do frustum?
+   * `planes` são 6 planos (a,b,c,d) achatados num Float64Array, já em espaço do
+   * planeta e com a normal apontando para DENTRO do volume visível.
+   */
+  _outside(node, planes) {
+    for (let p = 0; p < 24; p += 4) {
+      const s = planes[p] * node.cx + planes[p + 1] * node.cy + planes[p + 2] * node.cz + planes[p + 3];
+      if (s < -node.boundR) return true;
+    }
+    return false;
+  }
+
+  /**
    * Seleciona o conjunto de folhas para a câmera dada.
    * @param {{x:number,y:number,z:number}} cam posição da câmera em espaço do planeta (m)
    * @param {Array} out recebe as folhas (é esvaziado)
    * @param {number} lodBias >1 reduz detalhe (ctx.quality.terrainLodBias)
+   * @param {Float64Array|null} planes frustum em espaço do planeta (6×4)
    */
-  select(cam, out, lodBias = 1) {
+  select(cam, out, lodBias = 1, planes = null) {
     this.frame++;
     out.length = 0;
+    this.leafCount = 0;
+    this.offscreenLeaves = 0;
+    this._planes = planes;
     const k = this.splitFactor / Math.max(0.2, lodBias);
-    for (let f = 0; f < 6; f++) this._select(this.roots[f], cam, out, k);
+    // O teto de nós é uma válvula: se o critério de distância pedir mais do que
+    // o orçamento, a árvore para de CRESCER (os filhos já existentes continuam
+    // sendo usados). Sem isso um bioma de amplitude alta consegue pedir dezenas
+    // de milhares de folhas e a fila nunca mais drena.
+    const canGrow = this.nodeCount < this.maxNodes;
+    for (let f = 0; f < 6; f++) this._select(this.roots[f], cam, out, k, planes, canGrow);
     return out;
   }
 
-  _select(node, cam, out, k) {
+  _select(node, cam, out, k, planes, canGrow) {
     const dx = cam.x - node.cx, dy = cam.y - node.cy, dz = cam.z - node.cz;
     const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - node.lodR;
     node._dist = d > 0 ? d : 0;
@@ -235,31 +274,46 @@ export class QuadSphere {
       return;
     }
     node._culled = false;
+    // Fora do frustum o nó continua EXISTINDO — apagá-lo abriria um buraco ao
+    // virar a câmera e faria `waitReady` nunca convergir — mas para de refinar
+    // muito antes.
+    const off = planes ? this._outside(node, planes) : false;
+    node._offscreen = off;
+    const kk = off ? k * this.offscreenFactor : k;
 
-    if (node.level < this.maxLevel && node._dist < k * node.arc) {
+    if (node.level < this.maxLevel && node._dist < kk * node.arc &&
+        (node.children || canGrow)) {
       node._split = true;
       const ch = node.children || this.subdivide(node);
-      this._select(ch[0], cam, out, k);
-      this._select(ch[1], cam, out, k);
-      this._select(ch[2], cam, out, k);
-      this._select(ch[3], cam, out, k);
+      this._select(ch[0], cam, out, k, planes, canGrow);
+      this._select(ch[1], cam, out, k, planes, canGrow);
+      this._select(ch[2], cam, out, k, planes, canGrow);
+      this._select(ch[3], cam, out, k, planes, canGrow);
     } else {
       node._split = false;
+      this.leafCount++;
+      if (off) this.offscreenLeaves++;
       out.push(node);
     }
   }
 
   /**
    * Nível que a seleção escolheria para uma direção — usado por `waitReady`
-   * para saber se o LOD daquele ponto já convergiu.
+   * para saber se o LOD daquele ponto já convergiu. Usa EXATAMENTE o mesmo
+   * critério de `select` (inclusive o frustum da última seleção); se divergisse,
+   * `waitReady` esperaria por um nível que a seleção nunca vai construir e toda
+   * captura pagaria o timeout inteiro.
    */
   wantedLevel(cam, dir, lodBias = 1) {
     const k = this.splitFactor / Math.max(0.2, lodBias);
+    const planes = this._planes;
     let node = this._rootFor(dir);
     for (;;) {
       const dx = cam.x - node.cx, dy = cam.y - node.cy, dz = cam.z - node.cz;
       const d = Math.max(0, Math.sqrt(dx * dx + dy * dy + dz * dz) - node.lodR);
-      if (node.level >= this.maxLevel || d >= k * node.arc) return node.level;
+      const kk = (planes && this._outside(node, planes)) ? k * this.offscreenFactor : k;
+      if (node.level >= this.maxLevel || d >= kk * node.arc) return node.level;
+      if (!node.children && this.nodeCount >= this.maxNodes) return node.level;
       const ch = node.children || this.subdivide(node);
       node = this._bestChild(ch, dir);
     }

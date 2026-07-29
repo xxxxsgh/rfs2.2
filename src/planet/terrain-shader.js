@@ -119,6 +119,12 @@ uniform float uSandAmount;
 uniform vec3  uSandColor;
 uniform float uBumpScale;
 uniform float uAerial;
+uniform float uFogSat;
+uniform float uFogGain;
+uniform float uStrataFreq;
+uniform float uStrataAmount;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 vec3 triWeights(vec3 n) {
   vec3 w = pow(abs(n), vec3(4.0));
@@ -160,6 +166,27 @@ float bumpH  = dot(blendW, layH);
 
 // A macro-variação é a diferença entre "terreno" e "textura repetida".
 diffuseColor.rgb *= mix(0.72, 1.30, macroV) * mix(0.82, 1.16, grain);
+
+// ── Estratificação sedimentar ─────────────────────────────────────────────
+// Bandas constantes em ALTITUDE (não em espaço de textura) são o que dá escala
+// legível a um paredão: sem elas a rocha vira uma mancha uniforme e a falésia
+// perde a altura — o item 6 do §8 do ARCHITECTURE. A frequência é quebrada pelo
+// campo macro para não sair uma régua perfeita, e o efeito some com a distância
+// porque uma banda de 20 m aliasa muito antes de chegar ao horizonte.
+float stratAlt = length(vTriPos) - uPlanetRadius;
+float stratFade = uStrataAmount * (1.0 - smoothstep(280.0, 2200.0, vViewDist));
+float strat = 0.0;
+if (stratFade > 0.001) {
+  float band = sin((stratAlt * uStrataFreq + macroV * 2.6 + sMid.r * 1.7) * 6.2831853);
+  strat = band * 0.5 + 0.5;
+  strat *= strat * (3.0 - 2.0 * strat);
+  // Só a rocha e a areia estratificam; solo e neve não têm camadas expostas.
+  float layerW = blendW.y + blendW.z * 0.45;
+  diffuseColor.rgb *= mix(1.0, mix(0.74, 1.20, strat), layerW * stratFade);
+  // Entra também no relevo: é a saliência que faz a luz rasante desenhar as
+  // camadas em vez de apenas mudar a cor.
+  bumpH += (strat - 0.5) * 0.55 * layerW * stratFade;
+}
 `;
 
 /**
@@ -196,19 +223,30 @@ const NORMAL_FS = /* glsl */`
 
 const AERIAL_FS = /* glsl */`
 {
-  // ── Perspectiva aérea ────────────────────────────────────────────────────
-  // Queda exponencial com a distância. A saturação PRÓPRIA do terreno cai,
-  // mas o matiz do resultado é o do céu — nunca cinza (ARCHITECTURE §8).
+  // ── Perspectiva aérea (ARCHITECTURE §8.2) ────────────────────────────────
+  // Queda exponencial com a distância. Teto em 0,94: a montanha mais distante
+  // ainda precisa se destacar do céu por uma sombra de contraste, senão o
+  // horizonte vira uma parede de cor chapada e some a leitura de profundidade.
   float fogF = 1.0 - exp(-uFogDensity * vViewDist);
-  fogF = clamp(fogF * uAerial, 0.0, 1.0);
+  fogF = clamp(fogF * uAerial, 0.0, 0.94);
 
   float mu = max(dot(-vViewW, uSunDir), 0.0);
-  // Halo de Mie: a névoa acende na direção do sol e escurece de costas.
-  vec3 fogCol = uFogColor * (0.72 + 2.4 * pow(mu, 8.0) + 0.55 * mu) * uSunColor;
+  // Halo de Mie MODERADO. O ganho anterior chegava a 3,7x e ainda multiplicava
+  // por uSunColor — mas o modulo sky ja entrega a radiância do horizonte com o sol
+  // integrado, então o produto estourava para branco puro exatamente no
+  // enquadramento das capturas do solo (câmera na direção do sol).
+  vec3 fogCol = uFogColor * uFogGain * (0.90 + 0.60 * pow(mu, 6.0) + 0.16 * mu);
 
-  float lum = dot(gl_FragColor.rgb, vec3(0.2126, 0.7152, 0.0722));
-  vec3 hueRef = uFogColor / max(max(uFogColor.r, max(uFogColor.g, uFogColor.b)), 1e-4);
-  vec3 desat = mix(gl_FragColor.rgb, hueRef * lum, fogF * 0.55);
+  // A névoa NUNCA pode ler como cinza nem como branco: reinjeta croma em torno
+  // da própria luminância. É o MATIZ do céu que tem de sobreviver à distância.
+  float fl = dot(fogCol, LUMA);
+  fogCol = max(mix(vec3(fl), fogCol, uFogSat), vec3(0.0));
+
+  // O terreno perde a SATURAÇÃO PRÓPRIA — puxar para a própria luminância baixa
+  // o croma sem mexer no matiz — e só então recebe o matiz do céu pelo
+  // espalhamento. Desbotar para um cinza neutro seria o erro clássico.
+  float lum = dot(gl_FragColor.rgb, LUMA);
+  vec3 desat = mix(gl_FragColor.rgb, vec3(lum), fogF * 0.50);
   gl_FragColor.rgb = mix(desat, fogCol, fogF);
 }
 `;
@@ -261,6 +299,13 @@ export function createTerrainMaterial(ctx, biome, radius) {
     uSandAmount: { value: (terr.seaLevel || 0) > 0.02 ? 0.7 : 0.35 },
     uSandColor: { value: new THREE.Color(sandLin[0], sandLin[1], sandLin[2]) },
     uBumpScale: { value: 0.85 },
+    /** >1 empurra a névoa para longe do cinza sem mudar o matiz. */
+    uFogSat: { value: 1.30 },
+    /** Escala da radiância que `sky` publica; existe para poder domar um céu HDR. */
+    uFogGain: { value: 1.0 },
+    /** Uma camada sedimentar a cada ~19 m — escala de leitura humana. */
+    uStrataFreq: { value: 1 / 19 },
+    uStrataAmount: { value: cls === 'lush' || cls === 'ocean' ? 0.55 : 0.9 },
   };
 
   const material = new THREE.MeshStandardMaterial({

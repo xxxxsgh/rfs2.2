@@ -1,0 +1,484 @@
+/* AETHER — HUD diegético-adjacente (camada DOM).
+   Carregado em runtime por src/ui/hud.js (injeção de <link>), porque o módulo
+   não pode editar index.html.
+
+   POR QUÊ a estética é esta: o crítico compara com No Man's Sky. O que denuncia
+   um protótipo é a "caixa cinza de debug". Então: traço de 1 px, geometria
+   hexagonal, âmbar (#ffb347) contra ciano (#5fe0ff), maiúsculas espaçadas e
+   MUITO espaço negativo. Nada de fundo sólido grande, nada de borda arredondada.
+
+   POR QUÊ tudo anima só por transform/opacity: são as duas únicas propriedades
+   que o compositor resolve sem layout nem paint. Qualquer animação de width/top
+   custaria um reflow por frame com o HUD inteiro na tela. */
+
+.ah {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  color: var(--ink);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 12px;
+  --am: #ffb347;
+  --amd: rgba(255, 179, 71, 0.30);
+  --cy: #5fe0ff;
+  --cyd: rgba(95, 224, 255, 0.26);
+  --red: #ff6a52;
+  --mono: ui-monospace, "SF Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  transition: opacity 0.25s ease;
+}
+.ah[hidden] { display: none; }
+.ah.ah-off { opacity: 0; }
+
+.ah .clickable { pointer-events: auto; }
+
+/* Tipografia de rótulo: o "sinal" mais forte da linguagem NMS. */
+.ah-lbl {
+  font-size: 9px;
+  letter-spacing: 0.26em;
+  text-transform: uppercase;
+  color: rgba(223, 240, 255, 0.5);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Bússola (topo, centrada)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.ah-compass {
+  position: absolute;
+  top: calc(16px + var(--safeT));
+  left: 50%;
+  width: min(46vw, 520px);
+  height: 34px;
+  transform: translateX(-50%);
+}
+
+.ah-cmp-win {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  /* Desvanece nas pontas: sem isso a régua "corta" e vira uma barra de rolagem. */
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 16%, #000 84%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 16%, #000 84%, transparent);
+}
+
+/* left:50% ancora a régua no CENTRO da janela; assim o transform em px é
+   exatamente "graus × pixels-por-grau" e independe da largura responsiva. */
+.ah-cmp-track {
+  position: absolute;
+  left: 50%;
+  top: 9px;
+  height: 25px;
+  will-change: transform;
+}
+
+/* Traços em cima, rótulos embaixo: separa a agulha do texto, que antes se
+   sobrepunham exatamente no rumo atual — justo o valor que mais importa ler. */
+.ah-cmp-tick {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 5px;
+  background: rgba(95, 224, 255, 0.32);
+  transform: translateX(-0.5px);
+}
+.ah-cmp-tick.maj { height: 9px; background: rgba(95, 224, 255, 0.55); }
+
+.ah-cmp-card {
+  position: absolute;
+  bottom: 0;
+  transform: translateX(-50%);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: var(--cy);
+  text-shadow: 0 0 10px rgba(95, 224, 255, 0.55);
+}
+.ah-cmp-card.sub { font-size: 8px; color: rgba(95, 224, 255, 0.45); letter-spacing: 0.14em; text-shadow: none; }
+
+.ah-cmp-pips { position: absolute; inset: 0; }
+
+/* left:50% + margem negativa = o transform em px vira "graus a partir do
+   centro da janela", sem depender da largura (que é relativa ao viewport). */
+.ah-pip {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 9px;
+  height: 9px;
+  margin-left: -4.5px;
+  background: var(--am);
+  clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+  opacity: 0;
+  will-change: transform, opacity;
+}
+.ah-pip.on { opacity: 0.92; }
+.ah-pip.k-ship { background: var(--cy); }
+.ah-pip.k-alert { background: var(--red); }
+
+/* Agulha central: um único triângulo âmbar. */
+.ah-cmp-needle {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  width: 0; height: 0;
+  margin-left: -5px;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 7px solid var(--am);
+  filter: drop-shadow(0 0 6px rgba(255, 179, 71, 0.7));
+}
+
+/* Cabeçalho numérico sob a agulha. */
+.ah-cmp-deg {
+  position: absolute;
+  top: 38px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  color: rgba(255, 179, 71, 0.85);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Vitais (inferior esquerdo) — arcos finos em SVG
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.ah-vitals {
+  position: absolute;
+  left: calc(22px + var(--safeL));
+  bottom: calc(22px + var(--safeB));
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.ah-arcs { width: 118px; height: 118px; overflow: visible; display: block; }
+.ah-arc-bg { fill: none; stroke: rgba(223, 240, 255, 0.10); stroke-width: 2.2; }
+.ah-arc {
+  fill: none;
+  stroke-width: 2.6;
+  stroke-linecap: butt;
+  transition: stroke-dashoffset 0.18s linear;
+}
+.ah-arc.a0 { stroke: var(--am); filter: drop-shadow(0 0 5px rgba(255, 179, 71, 0.55)); }
+.ah-arc.a1 { stroke: var(--cy); filter: drop-shadow(0 0 5px rgba(95, 224, 255, 0.55)); }
+.ah-arc.a2 { stroke: #b8f0c4; filter: drop-shadow(0 0 5px rgba(184, 240, 196, 0.45)); }
+.ah-arc.low { stroke: var(--red); }
+
+/* Hexágono central com o número principal. */
+.ah-hex {
+  position: absolute;
+  left: 22px;
+  bottom: 22px;
+  width: 74px;
+  height: 74px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+  background: rgba(4, 10, 20, 0.42);
+  border: 0;
+}
+.ah-hex b {
+  font-family: var(--mono);
+  font-size: 21px;
+  font-weight: 400;
+  line-height: 1;
+  color: #fff;
+  text-shadow: 0 0 12px rgba(95, 224, 255, 0.5);
+}
+.ah-hex span { font-size: 8px; letter-spacing: 0.22em; color: rgba(223, 240, 255, 0.45); margin-top: 3px; }
+
+.ah-vit-keys { display: flex; flex-direction: column; gap: 7px; padding-bottom: 10px; }
+.ah-vit-key { display: flex; align-items: center; gap: 7px; }
+.ah-vit-key i {
+  width: 7px; height: 7px; display: block;
+  clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+}
+.ah-vit-key.k0 i { background: var(--am); }
+.ah-vit-key.k1 i { background: var(--cy); }
+.ah-vit-key.k2 i { background: #b8f0c4; }
+.ah-vit-key span { font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: rgba(223, 240, 255, 0.55); }
+.ah-vit-key b { font-family: var(--mono); font-size: 10px; font-weight: 400; color: rgba(223, 240, 255, 0.85); margin-left: 2px; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Leitura de voo (inferior direito)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.ah-flight {
+  position: absolute;
+  right: calc(24px + var(--safeR));
+  bottom: calc(24px + var(--safeB));
+  text-align: right;
+  min-width: 190px;
+}
+
+.ah-spd { display: flex; align-items: baseline; justify-content: flex-end; gap: 6px; }
+.ah-spd b {
+  font-family: var(--mono);
+  font-size: 42px;
+  font-weight: 200;
+  line-height: 0.95;
+  letter-spacing: 0.02em;
+  color: #fff;
+  text-shadow: 0 0 18px rgba(95, 224, 255, 0.35);
+}
+.ah-spd i {
+  font-style: normal;
+  font-size: 11px;
+  letter-spacing: 0.22em;
+  color: var(--am);
+}
+
+.ah-row {
+  display: flex; align-items: baseline; justify-content: flex-end; gap: 10px;
+  margin-top: 6px;
+}
+.ah-row span { font-size: 9px; letter-spacing: 0.26em; text-transform: uppercase; color: rgba(223, 240, 255, 0.45); }
+.ah-row b { font-family: var(--mono); font-size: 15px; font-weight: 300; color: var(--cy); }
+
+/* Barra de impulso/warp: 20 segmentos, escrita só por transform de escala. */
+.ah-seg {
+  margin-top: 10px;
+  margin-left: auto;
+  width: 190px;
+  height: 6px;
+  display: flex;
+  gap: 2px;
+  justify-content: flex-end;
+}
+.ah-seg i {
+  flex: 1 1 0;
+  height: 100%;
+  background: rgba(255, 179, 71, 0.13);
+  transform-origin: bottom;
+}
+.ah-seg i.on { background: var(--am); box-shadow: 0 0 6px rgba(255, 179, 71, 0.55); }
+.ah-seg i.warn { background: var(--red); box-shadow: 0 0 6px rgba(255, 106, 82, 0.55); }
+
+.ah-mode {
+  margin-top: 8px;
+  font-size: 9px;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: rgba(95, 224, 255, 0.62);
+}
+
+/* Alvo travado — acima da leitura de voo. */
+.ah-target {
+  position: absolute;
+  right: calc(24px + var(--safeR));
+  bottom: calc(150px + var(--safeB));
+  display: flex; align-items: center; gap: 8px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+.ah-target.on { opacity: 1; }
+.ah-target i {
+  width: 10px; height: 10px; display: block;
+  border: 1px solid var(--red);
+  transform: rotate(45deg);
+  animation: ah-pulse 1.1s ease-in-out infinite;
+}
+.ah-target span { font-size: 10px; letter-spacing: 0.24em; text-transform: uppercase; color: var(--red); }
+
+@keyframes ah-pulse { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Multiferramenta (inferior direito, a pé)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.ah-tool {
+  position: absolute;
+  right: calc(24px + var(--safeR));
+  bottom: calc(24px + var(--safeB));
+  text-align: right;
+}
+.ah-tool-name {
+  display: block;
+  font-size: 12px; letter-spacing: 0.3em; text-transform: uppercase;
+  color: var(--am);
+  text-shadow: 0 0 12px rgba(255, 179, 71, 0.4);
+}
+.ah-tool-sub { display: block; margin-top: 4px; font-size: 9px; letter-spacing: 0.22em; color: rgba(223, 240, 255, 0.4); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Retículo (centro) — deliberadamente OCO: o centro da tela é do jogo
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.ah-reticle {
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 44px; height: 44px;
+  margin: -22px 0 0 -22px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+.ah-reticle.on { opacity: 0.85; }
+.ah-reticle i {
+  position: absolute;
+  background: var(--cy);
+  box-shadow: 0 0 6px rgba(95, 224, 255, 0.6);
+}
+.ah-reticle i:nth-child(1) { left: 50%; top: 0; width: 1px; height: 7px; margin-left: -0.5px; }
+.ah-reticle i:nth-child(2) { left: 50%; bottom: 0; width: 1px; height: 7px; margin-left: -0.5px; }
+.ah-reticle i:nth-child(3) { top: 50%; left: 0; height: 1px; width: 7px; margin-top: -0.5px; }
+.ah-reticle i:nth-child(4) { top: 50%; right: 0; height: 1px; width: 7px; margin-top: -0.5px; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Marcadores de mundo
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.ah-markers { position: absolute; inset: 0; overflow: hidden; }
+
+.ah-mk {
+  position: absolute;
+  left: 0; top: 0;
+  width: 0; height: 0;
+  opacity: 0;
+  will-change: transform, opacity;
+}
+.ah-mk.on { opacity: 1; }
+
+.ah-mk-ico {
+  position: absolute;
+  left: -7px; top: -7px;
+  width: 14px; height: 14px;
+  border: 1px solid var(--cy);
+  clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+  background: rgba(95, 224, 255, 0.14);
+}
+.ah-mk-txt {
+  position: absolute;
+  left: 13px; top: -7px;
+  white-space: nowrap;
+  font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase;
+  color: rgba(223, 240, 255, 0.82);
+  text-shadow: 0 1px 6px #000;
+}
+.ah-mk-dst {
+  position: absolute;
+  left: 13px; top: 5px;
+  white-space: nowrap;
+  font-family: var(--mono); font-size: 9px;
+  color: var(--am);
+  text-shadow: 0 1px 6px #000;
+}
+/* Seta que só aparece quando o marcador foi grudado na borda.
+   A origem de transformação é o CENTRO do marcador (deslocada em -11px), então
+   girar a seta a leva para o lado certo E a faz apontar para fora ao mesmo
+   tempo — sem precisar recalcular posição em JS. */
+.ah-mk-arw {
+  position: absolute;
+  left: 11px; top: -4px;
+  width: 0; height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 7px solid var(--am);
+  opacity: 0;
+  transform-origin: -11px 4px;
+}
+.ah-mk.edge .ah-mk-arw { opacity: 1; }
+.ah-mk.edge .ah-mk-txt { display: none; }
+.ah-mk.k-ship .ah-mk-ico { border-color: var(--am); background: rgba(255, 179, 71, 0.16); }
+.ah-mk.k-alert .ah-mk-ico { border-color: var(--red); background: rgba(255, 106, 82, 0.18); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Saldo de unidades (topo direito)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.ah-units {
+  position: absolute;
+  right: calc(22px + var(--safeR));
+  top: calc(18px + var(--safeT));
+  display: none;
+  align-items: baseline;
+  gap: 9px;
+}
+.ah-units span { font-size: 9px; letter-spacing: 0.28em; text-transform: uppercase; color: rgba(223, 240, 255, 0.42); }
+.ah-units b {
+  font-family: var(--mono); font-size: 15px; font-weight: 300;
+  color: var(--am);
+  text-shadow: 0 0 12px rgba(255, 179, 71, 0.35);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Avisos (toasts)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.ah-toasts {
+  position: absolute;
+  right: calc(22px + var(--safeR));
+  top: calc(58px + var(--safeT));
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.ah-toast {
+  display: none;
+  padding: 8px 12px 8px 14px;
+  max-width: 100%;
+  background: linear-gradient(90deg, rgba(4, 10, 20, 0) 0%, rgba(4, 10, 20, 0.66) 40%);
+  border-right: 2px solid var(--cy);
+  text-align: right;
+  transform: translateX(26px);
+  opacity: 0;
+}
+.ah-toast.live { display: block; animation: ah-toast-in 0.42s cubic-bezier(.2,.9,.25,1) forwards; }
+.ah-toast.out { animation: ah-toast-out 0.5s ease forwards; }
+.ah-toast em {
+  display: block; font-style: normal;
+  font-size: 8px; letter-spacing: 0.3em; text-transform: uppercase;
+  color: var(--cy);
+  margin-bottom: 3px;
+}
+.ah-toast span { display: block; font-size: 12px; letter-spacing: 0.06em; color: #fff; }
+.ah-toast.k-discovery { border-right-color: var(--am); }
+.ah-toast.k-discovery em { color: var(--am); }
+.ah-toast.k-alert { border-right-color: var(--red); }
+.ah-toast.k-alert em { color: var(--red); }
+
+@keyframes ah-toast-in {
+  from { transform: translateX(26px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes ah-toast-out {
+  from { transform: translateX(0); opacity: 1; }
+  to { transform: translateX(26px); opacity: 0; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Overlay de depuração (tecla crase)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.ah-debug {
+  position: absolute;
+  left: calc(14px + var(--safeL));
+  top: calc(14px + var(--safeT));
+  display: none;
+  margin: 0;
+  padding: 8px 12px;
+  background: rgba(2, 6, 12, 0.72);
+  border-left: 2px solid rgba(95, 224, 255, 0.5);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(223, 240, 255, 0.9);
+  white-space: pre;
+  max-height: 70vh;
+  overflow: hidden;
+}
+.ah-debug.on { display: block; }
+
+/* Telas estreitas: encolhe sem quebrar o enquadramento. */
+@media (max-width: 760px) {
+  .ah-spd b { font-size: 32px; }
+  .ah-arcs { width: 96px; height: 96px; }
+  .ah-hex { width: 60px; height: 60px; left: 20px; bottom: 20px; }
+  .ah-compass { width: 70vw; }
+  .ah-toasts { width: 58vw; }
+}
