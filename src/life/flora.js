@@ -46,8 +46,8 @@ export const order = 50;
  * sobreposição que elimina o pop.
  */
 const BANDS = [
-  { in: [-1, 0], out: [55, 78] },        // LOD 0 — malha cheia
-  { in: [52, 78], out: [190, 245] },     // LOD 1 — malha média
+  { in: [-1, 0], out: [42, 60] },        // LOD 0 — malha cheia
+  { in: [40, 60], out: [190, 245] },     // LOD 1 — malha média
   { in: [188, 245], out: [520, 625] },   // LOD 2 — malha mínima
   { in: [515, 625], out: [1050, 1250] }, // imposter — cartão único
 ];
@@ -60,13 +60,19 @@ const IMP_TILE = 128;    // lado do tile, em pixels
  * passo e alcance diferentes — é isso que dá cobertura densa perto e silhueta
  * legível longe sem pagar por células minúsculas a um quilômetro.
  */
+/**
+ * INVARIANTE: o raio de cada anel tem de ser MAIOR que o fim da janela de
+ * dissolução do LOD mais distante que ele usa. Se a célula sumisse antes de a
+ * dissolução terminar, o jogador veria a vegetação nascer opaca na borda do
+ * anel — exatamente o pop que o dither existe para evitar.
+ */
 const RINGS = [
-  // Tapete de detalhe: só cobertura baixa, densíssima, some antes dos 60 m.
-  { name: 'carpet', cell: 32, radius: 58, spacing: 1.45, maxSlots: 24, scope: 'carpet', lods: [0], imposter: false, densityMul: 2.4, scaleMul: 0.72 },
-  // Cobertura média: arbusto, samambaia, flor, tufo grande.
-  { name: 'ground', cell: 96, radius: 255, spacing: 4.4, maxSlots: 22, scope: 'small', lods: [0, 1], imposter: false, densityMul: 1.0, scaleMul: 1.0 },
-  // Copa: tudo que tem silhueta a distância.
-  { name: 'canopy', cell: 384, radius: 1250, spacing: 13.5, maxSlots: 28, scope: 'tall', lods: [0, 1, 2], imposter: true, densityMul: 1.0, scaleMul: 1.0 },
+  // Tapete de detalhe: cobertura rasteira densíssima, some no fim do LOD0 (60 m).
+  { name: 'carpet', cell: 32, radius: 66, spacing: 1.0, maxSlots: 32, scope: 'carpet', lods: [0], imposter: false, densityMul: 3.0, scaleMul: 0.70 },
+  // Cobertura média: arbusto, samambaia, flor, tufo grande. Vai até o fim do LOD1.
+  { name: 'ground', cell: 96, radius: 258, spacing: 4.0, maxSlots: 24, scope: 'small', lods: [0, 1], imposter: false, densityMul: 1.1, scaleMul: 1.0 },
+  // Copa: tudo que tem silhueta a distância, até o fim do imposter.
+  { name: 'canopy', cell: 384, radius: 1290, spacing: 13.5, maxSlots: 28, scope: 'tall', lods: [0, 1, 2], imposter: true, densityMul: 1.0, scaleMul: 1.0 },
 ];
 
 // Faces do cubo → esfera. Mapeamento com warp tangente para células de área
@@ -813,11 +819,8 @@ function playerDir(ctx, out) {
 /** Redescobre quais células cada anel precisa e enfileira as que faltam. */
 function scanRings(ctx) {
   const pos = ctx.player.position;
-  const qual = clamp(ctx.quality?.floraDensity ?? 1, 0.05, 2);
-  // Em qualidade baixa encolhemos o alcance antes de encolher a densidade:
-  // é melhor um bosque denso e curto do que um deserto ralo e longo.
-  const radMul = clamp(0.55 + 0.45 * qual, 0.45, 1.15);
-
+  // O alcance NÃO é reduzido por qualidade: encolher o raio quebraria o
+  // casamento com as janelas de dissolução. Qualidade mexe só na densidade.
   playerDir(ctx, _dir);
 
   for (const ring of S.rings) {
@@ -829,7 +832,7 @@ function scanRings(ctx) {
     if (moved < trig && ring.cells.size > 0) continue;
     ring.lastCenter.copy(pos);
 
-    const radius = def.radius * radMul;
+    const radius = def.radius;
     ring.wanted.clear();
     tangentBasis(_dir, _tA, _tB);
 

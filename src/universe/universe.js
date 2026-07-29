@@ -444,15 +444,21 @@ function getSystem(index) {
   if (phys.binary) {
     const b = phys.binary;
     blackbodyRGBFast(b.temp, _rgb);
+    // Par FECHADO, bem dentro da órbita mais interna. É a única configuração
+    // estável para planetas circumbinários — e também a mais bonita: os dois
+    // sóis aparecem juntos no céu de todos os mundos, com sombras duplas.
+    const separation = Math.min(b.separationAU * auToM, aMinM * 0.35);
     star.binary = {
       class: b.cls,
       className: b.className,
       temp: b.temp,
       luminosity: b.luminosity,
       color: new THREE.Color().setRGB(_rgb.r, _rgb.g, _rgb.b, THREE.LinearSRGBColorSpace),
-      radius: SOLAR_RADIUS * b.radiusSolar * Math.sqrt(compress),
-      separation: b.separationAU * auToM,
-      period: 2 * Math.PI * Math.sqrt(Math.pow(b.separationAU * auToM, 3) / (gmStar * (1 + b.massSolar / phys.massSolar))),
+      // Mesma escala visual do primário: preserva a razão de raios reais e
+      // herda os limites angulares já aplicados a `starRadius`.
+      radius: Math.min(starRadius * (b.radiusSolar / phys.radiusSolar), aMinM / 5),
+      separation,
+      period: 2 * Math.PI * Math.sqrt(Math.pow(separation, 3) / (gmStar * (1 + b.massSolar / phys.massSolar))),
       phase: b.phase,
       inclination: b.inclination,
       /** Posição de mundo, atualizada em update(). */
@@ -685,7 +691,7 @@ function runTextureJobs(ctx) {
     if (j.y >= j.h) _texJobs.shift();
     // Além disto o orçamento é dos outros módulos.
   } while (_texJobs.length && performance.now() - t0 < 1.2 && ctx.budget.canWork());
-  ctx.debug.set('universe.texJobs', _texJobs.length);
+  if (ctx.debug.enabled) ctx.debug.set('universe.texJobs', _texJobs.length);
 }
 
 const _hexRgb = [0, 0, 0];
@@ -980,6 +986,7 @@ const RING_FRAG = /* glsl */`
 #include <logdepthbuf_pars_fragment>
 uniform sampler2D uRingMap;
 uniform vec3 uSunLocal;   // direção para a estrela no espaço LOCAL do corpo
+uniform vec3 uSunWorld;   // a MESMA direção em espaço de mundo
 uniform vec3 uSunColor;
 varying float vR;
 varying vec3 vLocal;
@@ -998,7 +1005,10 @@ void main() {
 
   vec3 V = normalize(cameraPosition - vWorld);
   // Gelo em contraluz espalha para frente: o anel acende quando o sol está atrás.
-  float fwd = pow(max(0.0, dot(-V, uSunLocal)), 5.0);
+  // Este termo é geométrico entre olho e estrela, então tem de usar a direção
+  // em MUNDO — misturar com uSunLocal (espaço do corpo) daria um brilho girando
+  // junto com a inclinação axial.
+  float fwd = pow(max(0.0, dot(-V, uSunWorld)), 5.0);
   float lightness = 0.34 + 0.66 * shadow + fwd * 0.9;
 
   vec3 col = t.rgb * uSunColor * lightness;
@@ -1103,6 +1113,7 @@ function buildBodyGraphics(ctx, body) {
       uniforms: {
         uRingMap: { value: ringTex },
         uSunLocal: { value: new THREE.Vector3(1, 0, 0) },
+        uSunWorld: { value: new THREE.Vector3(1, 0, 0) },
         uSunColor: { value: new THREE.Color(1, 1, 1) },
         uInner: { value: body.rings.inner },
         uOuter: { value: body.rings.outer },
@@ -1309,6 +1320,7 @@ function updateBodyGraphics(ctx, sys, body, dt) {
     _q.copy(g.quaternion).invert();
     _v3b.copy(_v3).applyQuaternion(_q);
     gfx.ringMat.uniforms.uSunLocal.value.copy(_v3b);
+    gfx.ringMat.uniforms.uSunWorld.value.copy(_v3);
     gfx.ringMat.uniforms.uSunColor.value.copy(sys.star.color).multiplyScalar(1.5);
   }
 }
@@ -1548,20 +1560,20 @@ export async function init(ctx) {
 export function update(dt, ctx) {
   if (!current) return;
 
-  const simDt = dt;
-  api.time += simDt * api.timeScale;
-  advanceOrbits(current, simDt);
+  api.time += dt * api.timeScale;
+  advanceOrbits(current, dt);
   api.belts = current.asteroidBelts;
 
   runTextureJobs(ctx);
 
-  // Telemetria auditada pelo crítico: sem console.log em lugar nenhum.
+  // O corpo mais próximo é consumido por voo/HUD/combate: sempre calculado
+  // (é livre de alocação). Já as linhas de telemetria montam strings, então só
+  // rodam com o overlay ligado — caminho quente não aloca.
+  const near = findNearestBody(ctx.player.position);
+  if (!ctx.debug.enabled) return;
   ctx.debug.set('sistema', `${current.name} · ${current.star.label}`);
   ctx.debug.set('corpos', `${current.bodies.length}p / ${current.allBodies.length - current.bodies.length}l / ${current.asteroidBelts.length}c`);
-  const near = findNearestBody(ctx.player.position);
-  if (near) {
-    ctx.debug.set('mais próximo', `${near.name} (${(_nearest.surface / 1000).toFixed(0)} km)`);
-  }
+  if (near) ctx.debug.set('mais próximo', `${near.name} (${(_nearest.surface / 1000).toFixed(0)} km)`);
   ctx.debug.set('t universo', `${(api.time / 86400).toFixed(1)} d ×${api.timeScale}`);
 }
 

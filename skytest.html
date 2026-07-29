@@ -125,15 +125,33 @@ async function run() {
       return [px[i], px[i + 1], px[i + 2]].map((n) => n.toFixed(4)).join(',');
     };
     const s = ctx.sky;
+    let nan = 0;
+    for (let i = 0; i < px.length; i++) if (!Number.isFinite(px[i])) nan++;
     L(name + ' | I=' + s.sunIntensity.toFixed(2)
-      + ' sunCol=' + [s.sunColor.r, s.sunColor.g, s.sunColor.b].map((v) => v.toFixed(2)).join(',')
       + ' | topo=' + [s.ambientTop.r, s.ambientTop.g, s.ambientTop.b].map((v) => v.toFixed(3)).join(',')
-      + ' | px meio=' + sample(0.5, 0.5)
-      + ' | px alto=' + sample(0.5, 0.9)
-      + ' | px baixo=' + sample(0.5, 0.12)
-      + ' | px esq=' + sample(0.08, 0.5)
-      + ' | px dir=' + sample(0.92, 0.5));
+      + ' | fog=' + [s.fogColor.r, s.fogColor.g, s.fogColor.b].map((v) => v.toFixed(3)).join(',')
+      + ' | meio=' + sample(0.5, 0.5)
+      + ' | alto=' + sample(0.5, 0.9)
+      + ' | baixo=' + sample(0.5, 0.12)
+      + ' | lados=' + sample(0.08, 0.5)
+      + ' | NaN=' + nan);
   }
+
+  // ── Custo por frame no enquadramento do arnês de captura ───────────────────
+  ctx.engine.resize(1600, 900);
+  ctx.player.position.set(0, R + 2.2, 0);
+  ctx.frame.rebaseTo(ctx.player.position);
+  ctx.sky.setTimeOfDay(0.755);
+  sky.update(0.016, ctx); sky.lateUpdate(0.016, ctx);
+  ctx.engine.camera.position.set(0, 0, 0);
+  ctx.engine.camera.lookAt(ctx.sky.sunDirection.x, 0.06, ctx.sky.sunDirection.z);
+  ctx.engine.renderToTarget(ctx.engine.sceneTarget);
+  await rr.readRenderTargetPixelsAsync(ctx.engine.sceneTarget, 0, 0, 1, 1, new Uint16Array(4));
+  const t0 = performance.now();
+  const N = 6;
+  for (let i = 0; i < N; i++) ctx.engine.renderToTarget(ctx.engine.sceneTarget);
+  await rr.readRenderTargetPixelsAsync(ctx.engine.sceneTarget, 0, 0, 1, 1, new Uint16Array(4));
+  L('custo ceu 1600x900 (swiftshader): ' + ((performance.now() - t0) / N).toFixed(1) + ' ms/frame');
 
   window.__RESULT__.done = true;
 }

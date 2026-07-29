@@ -420,10 +420,15 @@ function placeOnGround(ctx, body, c, worldPos) {
   c.altitude = r - gr;
 }
 
-/** Planta todos os pés na pose de repouso, sob os quadris. */
+/**
+ * Reancora todos os pés sob os quadris, na pose de repouso.
+ * Obrigatório sempre que a criatura andou SEM ser posada (LOD 1/2), depois de
+ * um teletransporte ou logo após o spawn: senão a IK tenta alcançar um ponto
+ * plantado dezenas de metros atrás e a perna vira um arame esticado.
+ */
 function resetFeet(ctx, body, c) {
   if (c.sp.traits.flying) return;   // voador não tem contato com o chão
-  const s = c.scale;
+  const s = c.scale * Math.max(0.001, c.grow);
   const rig = c.sp.rig;
   _right.crossVectors(c.up, c.fwd).normalize();
   for (let i = 0; i < rig.legs.length; i++) {
@@ -434,11 +439,15 @@ function resetFeet(ctx, body, c) {
       c.pos.z + _right.z * L.restFoot.x * s + c.fwd.z * L.restFoot.z * s,
     );
     snapToGround(ctx, body, st.toWorld);
+    // O alvo da IK é o TORNOZELO, não o dedo: num bicho digitígrado ele fica
+    // acima do solo. Ignorar isso força a perna a esticar demais o tempo todo.
+    st.toWorld.addScaled(c.up, L.restFoot.y * s);
     st.footWorld.copy(st.toWorld);
     st.fromWorld.copy(st.toWorld);
     st.stance = true;
     st.lift = 0;
   }
+  c.feetStale = false;
 }
 
 function snapToGround(ctx, body, v) {

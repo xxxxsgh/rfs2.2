@@ -155,7 +155,6 @@ export class CascadedShadows {
 
     // Temporários de escopo de módulo — zero alocação por frame.
     this._v0 = new THREE.Vector3();
-    this._v1 = new THREE.Vector3();
     this._center = new THREE.Vector3();
     this._up = new THREE.Vector3(0, 1, 0);
     this._lightBasis = new THREE.Object3D();
@@ -173,6 +172,7 @@ export class CascadedShadows {
       cascades: opts.cascades ?? 3,
       tile: opts.tile ?? 1024,
       taps: opts.taps ?? 16,
+      pcfTexels: opts.pcfTexels,
     });
   }
 

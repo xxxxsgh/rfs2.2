@@ -30,13 +30,18 @@ export class GpuProfiler {
 
     this.enabled = false;
     this._free = [];
-    this._pending = [];
+    // Arrays paralelos em vez de {q,name}: o profiler roda por frame e um
+    // objeto novo por passe por frame é lixo gratuito para o GC.
+    this._pendingQ = [];
+    this._pendingName = [];
     this._active = null;
     this._activeName = '';
     this._cpuStart = 0;
     /** Média móvel em ms por nome de passe. */
     this.ms = new Map();
     this._maxPool = 24;
+    this._resolved = 0;
+    this._starvedPolls = 0;
     /** 'gpu' quando há queries de verdade, 'cpu' no fallback. */
     this.mode = this.available ? 'gpu' : 'cpu';
   }
@@ -65,7 +70,7 @@ export class GpuProfiler {
     const gl = this.gl;
     let q = this._free.pop();
     if (!q) {
-      if (this._pending.length >= this._maxPool) return;
+      if (this._pendingQ.length >= this._maxPool) return;
       q = gl.createQuery();
       if (!q) { this.available = false; this.enabled = false; return; }
     }
@@ -91,7 +96,8 @@ export class GpuProfiler {
     const gl = this.gl;
     try {
       gl.endQuery(this.ext.TIME_ELAPSED_EXT);
-      this._pending.push({ q: this._active, name: this._activeName });
+      this._pendingQ.push(this._active);
+      this._pendingName.push(this._activeName);
     } catch (e) {
       this._free.push(this._active);
     }
@@ -102,28 +108,45 @@ export class GpuProfiler {
   poll() {
     if (!this.available) return;
     const gl = this.gl;
+
+    // Alguns backends (ANGLE/SwiftShader, drivers antigos) anunciam a extensão
+    // e nunca marcam a query como disponível. Sem esta saída o profiler ficaria
+    // eternamente vazio e o overlay não mostraria custo nenhum.
+    if (this._pendingQ.length > 0 && this._resolved === 0) {
+      if (++this._starvedPolls > 60) {
+        this.available = false;
+        this.mode = 'cpu';
+        this._flush();
+        return;
+      }
+    }
+
     const disjoint = gl.getParameter(this.ext.GPU_DISJOINT_EXT);
-    for (let i = this._pending.length - 1; i >= 0; i--) {
-      const item = this._pending[i];
+    for (let i = this._pendingQ.length - 1; i >= 0; i--) {
+      const q = this._pendingQ[i];
       let ready = false;
-      try { ready = gl.getQueryParameter(item.q, gl.QUERY_RESULT_AVAILABLE); }
+      try { ready = gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE); }
       catch (e) { ready = true; }
       if (!ready) continue;
-      this._pending.splice(i, 1);
+      const name = this._pendingName[i];
+      this._pendingQ.splice(i, 1);
+      this._pendingName.splice(i, 1);
       if (!disjoint) {
         let ns = 0;
-        try { ns = gl.getQueryParameter(item.q, gl.QUERY_RESULT); } catch (e) { ns = 0; }
-        this._accumulate(item.name, ns / 1e6);
+        try { ns = gl.getQueryParameter(q, gl.QUERY_RESULT); } catch (e) { ns = 0; }
+        this._accumulate(name, ns / 1e6);
+        this._resolved++;
       }
-      this._free.push(item.q);
+      this._free.push(q);
     }
   }
 
   _flush() {
     const gl = this.gl;
-    for (const item of this._pending) { try { gl.deleteQuery(item.q); } catch (e) { /* ignora */ } }
+    for (const q of this._pendingQ) { try { gl.deleteQuery(q); } catch (e) { /* ignora */ } }
     for (const q of this._free) { try { gl.deleteQuery(q); } catch (e) { /* ignora */ } }
-    this._pending.length = 0;
+    this._pendingQ.length = 0;
+    this._pendingName.length = 0;
     this._free.length = 0;
   }
 

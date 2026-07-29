@@ -371,8 +371,13 @@ function requestChunks() {
       const e = S.chunks.get(n.id);
       if (e) { if (e.mesh) break; n = n.parent; continue; }
       const q = S.queue.get(n.id);
-      // Nós grossos primeiro à mesma distância — o fallback tem de existir.
-      const score = n._dist * (0.5 + 0.5 * n.level / maxLevel);
+      // Prioridade por NÍVEL e, dentro do nível, por distância.
+      // O conjunto desenhado só desce para os filhos quando os QUATRO estão
+      // prontos (é o que evita buraco e sobreposição), então servir a fila em
+      // largura faz o planeta refinar por camadas inteiras. Ordenar só por
+      // distância deixaria folhas profundas prontas sem os irmãos, e nada
+      // delas apareceria — trabalho feito e invisível.
+      const score = n.level * 3e6 + n._dist;
       if (q) { if (score < q.score) q.score = score; }
       else if (S.queue.size < MAX_QUEUE) S.queue.set(n.id, { node: n, score });
       n = n.parent;

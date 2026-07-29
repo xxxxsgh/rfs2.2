@@ -88,8 +88,11 @@ export const TYPE_INFO = {
 /** Parâmetros por nível de LOD. O imposter é gerado à parte, por RTT. */
 const LOD = [
   { radial: 7, depth: 4, cards: 1.00, seg: 4, revU: 12, revV: 6, blades: 5 },
-  { radial: 5, depth: 3, cards: 0.48, seg: 3, revU: 8, revV: 4, blades: 3 },
-  { radial: 3, depth: 2, cards: 0.20, seg: 2, revU: 5, revV: 3, blades: 2 },
+  // cards < 0.4 aciona os ramos "reduzidos" dos geradores (metade dos caules,
+  // frondes e verticilos). Sem esse degrau o LOD1 custa quase o mesmo que o
+  // LOD0 e o anel de cobertura média vira o gargalo de triângulos.
+  { radial: 5, depth: 3, cards: 0.38, seg: 3, revU: 8, revV: 4, blades: 3 },
+  { radial: 3, depth: 2, cards: 0.16, seg: 2, revU: 5, revV: 3, blades: 2 },
 ];
 
 export const LOD_COUNT = LOD.length;
@@ -692,9 +695,9 @@ GEN.tree_broad = (mb, rng, pal, P, L, H) => {
 
 GEN.dead_tree = (mb, rng, pal, P, L, H) => {
   const S = {
-    L: { ...L, depth: Math.min(4, L.depth + 1) }, taper: 0.86, minRad: H * 0.002,
+    L, taper: 0.86, minRad: H * 0.002,
     angle: rng.range(0.7, 1.25), lenRatio: rng.range(0.54, 0.7), radRatio: rng.range(0.44, 0.6),
-    childMin: 2, childMax: 3, leader: 0.35, phototropism: 0.35, droop: 0.2, wobble: 4.0,
+    childMin: 2, childMax: 3, leader: 0.35, phototropism: 0.35, droop: 0.2, wobble: 5.0,
     windGain: 0.35, minLen: H * 0.05, foliage: 0, clusterR: 0.6, flatten: 1,
   };
   growBranch(mb, rng, pal, S, { x: 0, y: 0, z: 0 }, { x: rng.range(-0.16, 0.16), y: 1, z: rng.range(-0.16, 0.16) },
@@ -770,7 +773,7 @@ GEN.tree_palm = (mb, rng, pal, P, L, H) => {
   const tl = Math.hypot(tipDir.x, tipDir.y, tipDir.z);
   tipDir.x /= tl; tipDir.y /= tl; tipDir.z /= tl;
 
-  const fronds = Math.max(3, Math.round(rng.intRange(7, 11) * (L.cards > 0.4 ? 1 : L.cards * 1.6 + 0.35)));
+  const fronds = Math.max(3, Math.round(rng.intRange(7, 11) * (0.34 + 0.66 * L.cards)));
   const fseg = Math.max(3, L.seg + 2);
   const col = [0, 0, 0];
   for (let f = 0; f < fronds; f++) {

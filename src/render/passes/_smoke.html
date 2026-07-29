@@ -27,7 +27,19 @@ ctx.engine.scene.add(bright);
 ctx.engine.camera.position.set(0, 0, 8);
 
 // Sol falso para exercitar os godrays.
-ctx.sky = { sunDirection: new THREE.Vector3(0.3, 0.4, 0.86).normalize(), sunColor: new THREE.Color(1, 0.9, 0.75), sunIntensity: 3 };
+ctx.sky = { sunDirection: new THREE.Vector3(0.18, 0.22, -0.96).normalize(), sunColor: new THREE.Color(1, 0.9, 0.75), sunIntensity: 3 };
+
+// Chão + caixas encostadas: dá contato para a SSAO ocluir.
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40),
+  new THREE.MeshStandardMaterial({ color: 0x88aa66, roughness: 0.9 }));
+floor.rotation.x = -Math.PI / 2; floor.position.y = -2.2;
+ctx.engine.scene.add(floor);
+for (let i = 0; i < 5; i++) {
+  const b = new THREE.Mesh(new THREE.BoxGeometry(1.1, 1.1, 1.1),
+    new THREE.MeshStandardMaterial({ color: 0x996655, roughness: 0.8 }));
+  b.position.set(-4 + i * 2, -1.65, 2 + (i % 2));
+  ctx.engine.scene.add(b);
+}
 
 const out = { phase: 'init' };
 try {
@@ -81,7 +93,7 @@ try {
   ctx.postfx.setParam('ssao', 'dirs', 6); ctx.postfx.setParam('ssao', 'steps', 6);
   ctx.postfx.setParam('godrays', 'samples', 48);
   ctx.postfx.setParam('motionBlur', 'taps', 13);
-  for (let i = 0; i < 4; i++) { ctx.time.frames += 1; ctx.postfx.render(ctx); }
+  for (let i = 0; i < 90; i++) { ctx.time.frames += 1; ctx.engine.camera.position.x = Math.sin(i * 0.2) * 1.5; ctx.engine.camera.updateMatrixWorld(true); ctx.postfx.render(ctx); }
 
   out.phase = 'read';
   // A tela não pode estar preta.

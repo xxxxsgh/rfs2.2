@@ -168,7 +168,7 @@ export async function init(ctx) {
     width: 0, height: 0,
 
     /** Passes reprovados no auto-teste — nunca mais são executados. */
-    broken: { ssao: false, godrays: false, bloom: false, motionBlur: false, fxaa: false, composite: false },
+    broken: { copy: false, ssao: false, godrays: false, bloom: false, motionBlur: false, fxaa: false, composite: false },
 
     prevViewProj: new THREE.Matrix4(),
     prevValid: false,
@@ -385,6 +385,12 @@ export function render(ctx) {
 /** Caminho de emergência: cena → ACES → sRGB → tela. Nunca fica preto. */
 function _renderFallback(ctx) {
   const engine = ctx.engine;
+  if (S.broken.copy && !S.copy.ok.plain) {
+    // Nem o blit trivial compila (driver em frangalhos). Desenhar direto no
+    // framebuffer perde o tone map, mas o jogador continua enxergando o mundo.
+    engine.renderToTarget(null);
+    return;
+  }
   engine.renderToTarget(engine.sceneTarget);
   S.copy.present(S.renderer, S.quad, engine.sceneTarget.texture, S.params.exposure);
 }

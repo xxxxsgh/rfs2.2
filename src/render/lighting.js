@@ -304,7 +304,13 @@ export async function init(ctx) {
   scene.add(ambient);
 
   // ── Sombras em cascata ─────────────────────────────────────────────────────
-  csm = new CascadedShadows(ctx, { shadowFar: 8000 });
+  // Passa a config já resolvida no construtor: assim o atlas é alocado uma vez
+  // só, em vez de nascer no padrão e ser recriado no primeiro setQuality.
+  const cfg0 = qualityConfig(ctx.quality);
+  csm = new CascadedShadows(ctx, {
+    shadowFar: 8000,
+    cascades: cfg0.cascades, tile: cfg0.tile, taps: cfg0.taps, pcfTexels: cfg0.pcf,
+  });
   csm.onMaterialSeen = autoRegister;
   setQuality();
 
